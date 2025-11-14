@@ -1,0 +1,46 @@
+model:
+  name: SimpleCNN
+  input_shape: [1, 28, 28]
+  num_classes: 10
+  optimizer:
+    type: Adam
+    learning_rate: 0.001
+  loss_function: CrossEntropyLoss
+  metrics:
+    - accuracy
+    - loss
+  architecture:
+    - layer_type: Conv2d
+      params:
+        in_channels: 1
+        out_channels: 32
+        kernel_size: 3
+        stride: 1
+        padding: 1
+    - layer_type: ReLU
+    - layer_type: MaxPool2d
+      params:
+        kernel_size: 2
+        stride: 2
+    - layer_type: Conv2d
+      params:
+        in_channels: 32
+        out_channels: 64
+        kernel_size: 3
+        stride: 1
+        padding: 1
+    - layer_type: ReLU
+    - layer_type: MaxPool2d
+      params:
+        kernel_size: 2
+        stride: 2
+    - layer_type: Flatten
+    - layer_type: Linear
+      params:
+        in_features: 64 * 7 * 7
+        out_features: 128
+    - layer_type: ReLU
+    - layer_type: Linear
+      params:
+        in_features: 128
+        out_features: 10

@@ -1,0 +1,13 @@
+datasets:
+  mnist:
+    path: "data/mnist"
+    download: true
+    preprocessing:
+      normalize: true
+      one_hot_encode: true
+  fashion_mnist:
+    path: "data/fashion_mnist"
+    download: true
+    preprocessing:
+      normalize: true
+      one_hot_encode: true
