@@ -1,4 +1,9 @@
 numpy
 torch
+torchvision
+torchaudio
 matplotlib
 pyyaml
+scikit-learn
+jupyter
+pandas
