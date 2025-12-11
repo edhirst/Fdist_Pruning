@@ -44,8 +44,8 @@ class MagnitudeFIMIterativePruner(BasePruner):
             return fim_obj.get_diag().cpu()
             
         except ImportError:
-            all_weights = torch.cat([p.data.view(-1) for p in model.parameters() if p.requires_grad])
-            return torch.ones_like(all_weights)
+            total_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+            return torch.ones(total_params)
 
     def apply_pruning(self, model=None, train_loader=None, test_loader=None, device='cpu', prune_pcts=None):
         """
