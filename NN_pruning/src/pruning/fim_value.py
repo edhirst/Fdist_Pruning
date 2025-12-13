@@ -10,7 +10,7 @@ except Exception:
         def __init__(self):
             pass
 
-class FIMPruner(BasePruner):
+class fim_value(BasePruner):
     """
     Prunes weights based on Fisher Information Matrix (FIM).
     Requires nngeometry library for FIM computation.

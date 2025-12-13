@@ -11,7 +11,7 @@ except Exception:
             pass
 import torch 
 
-class MagnitudePruner(BasePruner):
+class Magnitude(BasePruner):
     """
     Prunes weights based on their absolute magnitude.
     Removes weights with the lowest absolute values.
