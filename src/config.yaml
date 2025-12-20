@@ -7,8 +7,15 @@ dataset:
   name: "mnist"
   # Change to "fashion_mnist" to use Fashion-MNIST instead
 
+
 model:
-  num_classes: 10
+  common:
+    model_type: "NN" # NN or CNN
+    num_classes: 10
+
+  NN:
+    hidden_size: 128
+    hidden_layers: 4  # number of hidden Linear layers (>=1)
 
 training:
   batch_size: 64
@@ -19,11 +26,15 @@ training:
 pruning:
   enable_pruning: true
   pruning_scheme: "magnitude"  # Options: magnitude, fim, magnitude_fim_one_shot, magnitude_fim_iterative, sqrt_averaged_magnitude_fim
-  pruning_threshold: 0.1
+  pruning_threshold: 0.9
   # For magnitude pruning: prune weights with |w| < threshold
                            # Typical values: 0.001-0.01 (prunes small weights)
                            # Higher = more aggressive pruning
-  fim_threshold: 0.1 # For FIM-based pruning methods
+  fim_threshold: 0.8 # For FIM-based pruning methods
+  fim_subset_size: 500 # subset for calculating FIM score
+  fim_subset_seed: 42  # reproducibility
+  fim_subset_shuffle: true
+  fim_calculate_method: "backprop" # Options: nngeometry, backprop
   iterative_pruning_steps: 5
   
 evaluation:
