@@ -11,7 +11,7 @@ except Exception:
             pass
 import torch 
 
-class Magnitude(BasePruner):
+class MagnitudePruner(BasePruner):
     """
     Prunes weights based on their absolute magnitude.
     Removes weights with the lowest absolute values.
@@ -23,7 +23,7 @@ class Magnitude(BasePruner):
     def set_parameters(self, threshold):
         self.threshold = threshold
 
-    def apply_pruning(self, model):
+    def apply_pruning(self, model, train_loader=None, device = 'cpu'):
         """
         Prunes weights globally based on magnitude threshold.
         
