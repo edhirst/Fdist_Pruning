@@ -10,47 +10,48 @@ except Exception:
         def __init__(self):
             pass
 
+from ..utils.fim_calculator import calculate_fim_nngeometry, calculate_fim_backprop
+
 class MagnitudeFIMOneShotPruner(BasePruner):
     """
     One-shot pruning combining magnitude and FIM scores.
     Combined score = FIM_diagonal * |weight|
     """
-    def __init__(self, model=None, magnitude_threshold=0.1, fim_threshold=0.1):
+    def __init__(self, parameters=None):
         super().__init__()
-        self.model = model
-        self.magnitude_threshold = magnitude_threshold
-        self.fim_threshold = fim_threshold
-        self.threshold = magnitude_threshold  # Use magnitude threshold as primary
+        self.parameters = parameters or {}
+        # Quantile threshold: e.g. 0.1 means prune the bottom 10% (keep top 90%)
+        self.threshold = float(self.parameters.get("pruning_threshold", 0.1))
+        # Backend selection: "nngeometry" or "backprop"
+        self.fim_calculate_method = str(self.parameters.get("fim_calculate_method", "nngeometry")).lower()
+
         self.epsilon = 1e-6
 
-    def set_parameters(self, magnitude_threshold=None, fim_threshold=None):
-        if magnitude_threshold is not None:
-            self.magnitude_threshold = magnitude_threshold
-            self.threshold = magnitude_threshold
-        if fim_threshold is not None:
-            self.fim_threshold = fim_threshold
+    def set_parameters(self, parameters):
+        self.parameters = parameters or {}
+        self.threshold = float(parameters.get("pruning_threshold", 0.1))
+        if not (0.0 <= self.threshold <= 1.0):
+            raise ValueError(f"pruning_threshold must be in [0,1], got {self.threshold}")
+        self.fim_calculate_method = str(self.parameters.get("fim_calculate_method", "nngeometry")).lower()
 
-    def calculate_fim(self, model, train_loader, device='cpu'):
-        """Calculate FIM diagonal"""
-        try:
-            from nngeometry import FIM
-            from nngeometry.object import PMatKFAC
-            
-            fim_obj = FIM(
-                model=model,
-                loader=train_loader,
-                representation=PMatKFAC,
-                variant='classif_logits',
-                device=device
+    def _calculate_fim(self, model, train_loader, device="cpu"):
+        """
+        Dispatch to the selected FIM backend.
+
+        Returns:
+            1D CPU tensor (FIM diagonal).
+        """
+        if self.fim_calculate_method in ("nngeometry", "nngeo"):
+            return calculate_fim_nngeometry(model, train_loader, device=device)
+        elif self.fim_calculate_method in ("backprop", "analytic"):
+            return calculate_fim_backprop(model, train_loader, device=device)
+        else:
+            raise ValueError(
+                f"Unknown fim_backend: {self.fim_calculate_method}. "
+                "Supported: 'nngeometry' or 'backprop'."
             )
-            return fim_obj.get_diag().cpu()
-            
-        except ImportError:
-            print("Warning: nngeometry not installed. Using uniform FIM.")
-            total_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-            return torch.ones(total_params)
 
-    def apply_pruning(self, model=None, train_loader=None, device='cpu'):
+    def apply_pruning(self, model, train_loader=None, device='cpu'):
         """
         Apply one-shot FIM x Magnitude pruning.
         
@@ -62,40 +63,56 @@ class MagnitudeFIMOneShotPruner(BasePruner):
         Returns:
             model: Pruned model
         """
-        if model is None:
-            model = self.model
         if train_loader is None:
             raise ValueError("One-shot FIM x Magnitude pruning requires train_loader")
-        
-        # Get all trainable weights
-        all_weights = torch.cat([p.data.view(-1) for p in model.parameters() if p.requires_grad]).cpu()
-        
-        # Calculate FIM diagonal
-        fim_diag = self.calculate_fim(model, train_loader, device)
-        
-        # Calculate combined importance score: (FIM + epsilon) * |weight|
-        combined_scores = (fim_diag + self.epsilon) * torch.abs(all_weights)
-        
-        # Determine threshold for pruning
-        threshold_value = torch.quantile(combined_scores, self.threshold)
-        
-        # Create global mask
-        mask_global = (combined_scores >= threshold_value).float()
-        
-        # Apply mask to each layer
+
+        # Flatten all trainable parameters in a stable order
+        params = [p for p in model.parameters() if p.requires_grad]
+        if not params:
+            print("FIM x Magnitude (One-Shot): no trainable parameters found.")
+            return model
+
+        all_weights = torch.cat([p.data.view(-1) for p in params], dim=0)
+        fim_diag = self._calculate_fim(model, train_loader, device=device).to(all_weights.device)
+
+        if fim_diag.numel() != all_weights.numel():
+            raise ValueError(
+                f"FIM diag length mismatch: fim={fim_diag.numel()} vs weights={all_weights.numel()}. "
+                "Your FIM calculator must return a vector aligned with flattened model.parameters()."
+            )
+
+        # Combined score
+        combined_scores = torch.sqrt(fim_diag) * all_weights.abs()
+
+        total = combined_scores.numel()
+        k_prune = int(round(self.threshold * total))
+
+        # Build keep-mask: True=keep, False=prune (guarantee exact pruning count)
+        if k_prune <= 0:
+            mask_global = torch.ones_like(combined_scores, dtype=torch.bool)
+        elif k_prune >= total:
+            mask_global = torch.zeros_like(combined_scores, dtype=torch.bool)
+        else:
+            prune_idx = torch.topk(combined_scores, k=k_prune, largest=False).indices
+            mask_global = torch.ones_like(combined_scores, dtype=torch.bool)
+            mask_global[prune_idx] = False
+
+        # Apply mask to each parameter tensor
         offset = 0
-        for param in model.parameters():
-            if param.requires_grad:
-                numel = param.numel()
-                param_mask = mask_global[offset:offset + numel].view_as(param).to(param.device)
-                param.data *= param_mask
-                offset += numel
-        
+        for p in params:
+            numel = p.numel()
+            p_mask = mask_global[offset:offset + numel].view_as(p)
+            p.data.mul_(p_mask.to(p.device))
+            offset += numel
+
         # Count pruned parameters
-        total_params = all_weights.numel()
-        pruned_params = (mask_global == 0).sum().item()
-        pruning_rate = 100.0 * pruned_params / total_params
-        
-        print(f"FIM x Magnitude (One-Shot): Pruned {pruned_params}/{total_params} parameters ({pruning_rate:.2f}%)")
-        
+        pruned_params = (~mask_global).sum().item()
+        remaining = total - pruned_params
+        pruning_rate = 100.0 * pruned_params / max(total, 1)
+
+        print(
+            f"FIM x Magnitude (One-Shot): "
+            f"Pruned {pruned_params}/{total} parameters ({pruning_rate:.2f}%), "
+            f"Remaining {remaining}"
+        )
         return model

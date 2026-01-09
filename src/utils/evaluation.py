@@ -1,10 +1,45 @@
 import numpy as np
 import torch
 import matplotlib.pyplot as plt
-from sklearn.metrics import matthews_corrcoef, precision_score
+from sklearn.metrics import matthews_corrcoef, precision_score, f1_score
 from scipy.stats import ttest_rel
 import copy
 import os
+
+
+@torch.no_grad()
+def _collect_preds_and_labels(model, dataloader, device="cpu"):
+    model.eval()
+    all_preds = []
+    all_labels = []
+    for inputs, labels in dataloader:
+        inputs = inputs.to(device)
+        labels = labels.to(device)
+        outputs = model(inputs)
+        preds = torch.argmax(outputs, dim=1)
+        all_preds.append(preds.detach().cpu().numpy())
+        all_labels.append(labels.detach().cpu().numpy())
+    all_preds = np.concatenate(all_preds, axis=0)
+    all_labels = np.concatenate(all_labels, axis=0)
+    return all_preds, all_labels
+
+
+def evaluate_accuracy(model, dataloader, device="cpu"):
+    preds, labels = _collect_preds_and_labels(model, dataloader, device)
+    return float((preds == labels).mean())
+
+def evaluate_precision(model, dataloader, device="cpu", average="macro"):
+    preds, labels = _collect_preds_and_labels(model, dataloader, device)
+    return float(precision_score(labels, preds, average=average, zero_division=0))
+
+def evaluate_f1(model, dataloader, device="cpu", average="macro"):
+    preds, labels = _collect_preds_and_labels(model, dataloader, device)
+    return float(f1_score(labels, preds, average=average, zero_division=0))
+
+def evaluate_mcc(model, dataloader, device="cpu"):
+    preds, labels = _collect_preds_and_labels(model, dataloader, device)
+    return float(matthews_corrcoef(labels, preds))
+
 
 
 def calculate_auc(pruning_percentages, accuracies):
@@ -19,42 +54,6 @@ def calculate_auc(pruning_percentages, accuracies):
     return auc
 
 
-def evaluate_accuracy(model, dataloader, device='cpu'):
-    """Evaluate model accuracy on a dataset"""
-    model.eval()
-    correct = 0
-    total = 0
-    with torch.no_grad():
-        for inputs, labels in dataloader:
-            inputs, labels = inputs.to(device), labels.to(device)
-            outputs = model(inputs)
-            _, predicted = outputs.max(1)
-            total += labels.size(0)
-            correct += predicted.eq(labels).sum().item()
-    accuracy = correct / total
-    return accuracy
-
-
-def get_mcc_and_precision(model, dataloader, device='cpu'):
-    """Calculate Matthews Correlation Coefficient and Precision"""
-    model.eval()
-    all_preds = []
-    all_labels = []
-    with torch.no_grad():
-        for inputs, labels in dataloader:
-            inputs, labels = inputs.to(device), labels.to(device)
-            outputs = model(inputs)
-            preds = torch.argmax(outputs, dim=1)
-            all_preds.append(preds.cpu().numpy())
-            all_labels.append(labels.cpu().numpy())
-    
-    all_preds = np.concatenate(all_preds)
-    all_labels = np.concatenate(all_labels)
-    mcc = matthews_corrcoef(all_labels, all_preds)
-    precision = precision_score(all_labels, all_preds, average='macro', zero_division=0)
-    return mcc, precision
-
-
 def get_model_size_kb(model):
     """Calculate model size in KB"""
     param_size = 0
@@ -63,7 +62,7 @@ def get_model_size_kb(model):
     buffer_size = 0
     for buffer in model.buffers():
         buffer_size += buffer.nelement() * buffer.element_size()
-    size_kb = (param_size + buffer_size) / 1024
+    size_kb = (param_size + buffer_size) / 1024.0
     return size_kb
 
 
@@ -76,6 +75,9 @@ def count_nonzero_params(model):
             total += param.numel()
             nonzero += torch.count_nonzero(param).item()
     return nonzero, total
+
+
+# ----------------- plot -----------------
 
 
 def plot_accuracy_comparison(prune_pcts, results_dict, title="Accuracy vs. Pruning Fraction", 

@@ -10,7 +10,7 @@ except Exception:
         def __init__(self):
             pass
 
-from utils.fim_calculator import calculate_fim_nngeometry, calculate_fim_backprop
+from ..utils.fim_calculator import calculate_fim_nngeometry, calculate_fim_backprop
 
 
 
@@ -25,14 +25,14 @@ class FIMPruner(BasePruner):
         # Quantile threshold: e.g. 0.1 means prune the bottom 10% (keep top 90%)
         self.threshold = float(self.parameters.get("pruning_threshold", 0.1))
         # Backend selection: "nngeometry" or "backprop"
-        self.fim_calculate_method = str(self.parameters.get("backprop", "nngeometry")).lower()
-
-        self.epsilon = 1e-6
+        self.fim_calculate_method = str(self.parameters.get("fim_calculate_method", "nngeometry")).lower()
 
     def set_parameters(self, parameters):
         self.parameters = parameters or {}
         self.threshold = float(self.parameters.get("pruning_threshold", 0.1))
-        self.fim_calculate_method = str(self.parameters.get("fim_backend", "nngeometry")).lower()
+        if not (0.0 <= self.threshold <= 1.0):
+            raise ValueError(f"pruning_threshold must be in [0,1], got {self.threshold}")
+        self.fim_calculate_method = str(self.parameters.get("fim_calculate_method", "nngeometry")).lower()
 
     def _calculate_fim(self, model, train_loader, device="cpu"):
         """
@@ -66,15 +66,21 @@ class FIMPruner(BasePruner):
         """
         if train_loader is None:
             raise ValueError("FIM pruning requires train_loader for FIM computation")
-        
+
         # Calculate FIM diagonal
         fim_diag = self._calculate_fim(model, train_loader, device)
         
-        # Determine threshold for pruning
-        threshold_value = torch.quantile(fim_diag, self.threshold)
-        
-        # Create global mask based on FIM values
-        mask_global = (fim_diag >= threshold_value).float()
+        total = fim_diag.numel()
+        k_prune = int(round(self.threshold * total))
+
+        if k_prune <= 0:
+            mask_global = torch.ones_like(fim_diag, dtype=torch.bool)
+        elif k_prune >= total:
+            mask_global = torch.zeros_like(fim_diag, dtype=torch.bool)
+        else:
+            prune_idx = torch.topk(fim_diag, k=k_prune, largest=False).indices
+            mask_global = torch.ones_like(fim_diag, dtype=torch.bool)
+            mask_global[prune_idx] = False
         
         # Apply mask to each layer
         offset = 0
