@@ -66,35 +66,69 @@ class FIMPruner(BasePruner):
         """
         if train_loader is None:
             raise ValueError("FIM pruning requires train_loader for FIM computation")
+        
+        model.to(device)
+
+        params = [p for p in model.parameters() if p.requires_grad]
+        if not params:
+            return model
+
+        # Flatten current weights (for active_mask) and compute total once from params
+        flat_w = torch.cat([p.data.view(-1) for p in params], dim=0)
+        total = int(flat_w.numel())        
+
+        # How many to prune this call (delta fraction of TOTAL)
+        k_target = int(round(self.threshold * total))
+        if k_target <= 0:
+            print(f"FIM Pruning: Pruned 0/{total} parameters (0.00%)")
+            return model
+
 
         # Calculate FIM diagonal
-        fim_diag = self._calculate_fim(model, train_loader, device)
+        fim_diag = self._calculate_fim(model, train_loader, device=device).to(flat_w.device)
         
-        total = fim_diag.numel()
-        k_prune = int(round(self.threshold * total))
+        
+        if fim_diag.numel() != total:
+            raise ValueError(
+                f"FIM diag length mismatch: fim={fim_diag.numel()} vs params={total}. "
+                "Ensure fim_calculator flattens parameters in the same order as model.parameters() (requires_grad only)."
+            )
 
-        if k_prune <= 0:
-            mask_global = torch.ones_like(fim_diag, dtype=torch.bool)
-        elif k_prune >= total:
-            mask_global = torch.zeros_like(fim_diag, dtype=torch.bool)
-        else:
-            prune_idx = torch.topk(fim_diag, k=k_prune, largest=False).indices
-            mask_global = torch.ones_like(fim_diag, dtype=torch.bool)
-            mask_global[prune_idx] = False
-        
-        # Apply mask to each layer
+        # Active-only selection (exclude already-zero weights)
+        active_mask = (flat_w != 0)
+        active_count = int(active_mask.sum().item())
+        if active_count == 0:
+            print(f"FIM Pruning: Pruned 0/{total} parameters (0.00%)")
+            return model
+
+        k = min(k_target, active_count)
+
+        # Select k smallest FIM among active weights
+        active_scores = fim_diag[active_mask]
+        prune_idx_in_active = torch.topk(active_scores, k=k, largest=False).indices
+        active_global_idx = active_mask.nonzero(as_tuple=False).view(-1)
+        prune_global_idx = active_global_idx[prune_idx_in_active]
+
+        # Build global boolean mask (True=keep, False=prune)
+        mask_global = torch.ones(total, dtype=torch.bool, device=flat_w.device)
+        mask_global[prune_global_idx] = False
+
+        # Apply mask back to each parameter
         offset = 0
-        for param in model.parameters():
-            numel = param.numel()
-            param_mask = mask_global[offset:offset + numel].view_as(param)
-            param.data.mul_(param_mask.to(param.data.device))
-            offset += numel
-        
-        # Count pruned parameters
-        total_params = fim_diag.numel()
-        pruned_params = (mask_global == 0).sum().item()
-        pruning_rate = 100.0 * pruned_params / total_params
-        
-        print(f"FIM Pruning: Pruned {pruned_params}/{total_params} parameters ({pruning_rate:.2f}%)")
-        
+        for p in params:
+            n = p.numel()
+            p_mask = mask_global[offset:offset + n].view_as(p).to(dtype=p.data.dtype, device=p.data.device)
+            p.data.mul_(p_mask)
+            offset += n
+
+        # Robust reporting: how many nonzero actually dropped
+        before_nz = int((flat_w != 0).sum().item())
+        after_flat = torch.cat([p.data.view(-1) for p in params], dim=0)
+        after_nz = int((after_flat != 0).sum().item())
+
+        pruned_params = before_nz - after_nz
+        pruning_rate = 100.0 * pruned_params / max(total, 1)
+
+        print(f"FIM Pruning: Pruned {pruned_params}/{total} parameters ({pruning_rate:.2f}%)")
+
         return model

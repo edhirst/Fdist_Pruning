@@ -6,6 +6,7 @@ import copy
 import torch
 import torch.nn as nn
 import matplotlib.pyplot as plt
+import json
 from datetime import datetime
 from torch.utils.data import DataLoader, Subset
 
@@ -20,9 +21,9 @@ from .utils.evaluation import (
 # Pruners
 from .pruning.magnitude_pruning import MagnitudePruner
 from .pruning.fim_pruning import FIMPruner
-from .pruning.f_dist_one_shot import MagnitudeFIMOneShotPruner
-from .pruning.magnitude_fim_iterative import MagnitudeFIMIterativePruner
-from .pruning.sqrt_averaged_magnitude_fim import SqrtAveragedMagnitudeFIMPruner
+from .pruning.f_dist_one_shot import FDistOneShotPruner
+from .pruning.f_dist_iterative import FDistIterativePruner
+from .pruning.f_dist import FDistPruner
 
 
 # load config from yaml
@@ -147,38 +148,40 @@ def build_pruner(config, scheme: str):
             "fim_calculate_method": p_cfg.get("fim_calculate_method", "nngeometry"),
         })
 
-    if scheme == "magnitude_fim_one_shot":
-        return MagnitudeFIMOneShotPruner(parameters={
+    if scheme == "f_dist_one_shot":
+        return FDistOneShotPruner(parameters={
             "pruning_threshold": 0.0,
             "fim_calculate_method": p_cfg.get("fim_calculate_method", "nngeometry"),
         })
 
-    if scheme == "magnitude_fim_iterative":
+    if scheme == "f_dist_iterative":
         # Your iterative pruner currently takes params dict at init in your snippet.
-        return MagnitudeFIMIterativePruner(
-            model=None,
-            params={
-                "pruning_threshold": 0.0,
-                "iterations": int(p_cfg.get("iterative_pruning_steps", 5)),
-            },
-        )
+        return FDistIterativePruner(parameters={
+            "pruning_step": 0.0,
+            "fim_calculate_method": p_cfg.get("fim_calculate_method", "nngeometry"),
+        })
 
-    if scheme == "sqrt_averaged_magnitude_fim":
-        return SqrtAveragedMagnitudeFIMPruner(
-            magnitude_threshold=0.0,
-            fim_threshold=float(p_cfg.get("fim_threshold", 0.8)),
-        )
+    if scheme == "f_dist":
+        return FDistPruner(parameters={
+            "pruning_step": 0.0,
+            "fim_calculate_method": p_cfg.get("fim_calculate_method", "nngeometry"),
+            "freeze_all_zero_tensors": True,
+        })
 
     raise ValueError(f"Unknown pruning_scheme: {scheme}")
 
 
-def plot_metric(ratios_pct, values, title, ylabel, save_path=None):
+def plot_metric(ratios, values, ylabel, save_path=None):
     plt.figure(figsize=(10, 6))
-    plt.plot(ratios_pct, values, marker="o")
-    plt.grid(True)
-    plt.xlabel("Pruning ratio (%)")
-    plt.ylabel(ylabel)
-    plt.title(title)
+    plt.plot(ratios, values, marker="o")
+    plt.grid(True, alpha=0.5)
+
+    plt.xlabel("Pruning ratio", fontdict= {"fontsize": 14})
+    plt.ylabel(ylabel, fontdict= {"fontsize": 14})
+
+    # normalized metric range
+    plt.ylim(-0.05, 1.05)
+
     plt.tight_layout()
     if save_path:
         plt.savefig(save_path, dpi=300, bbox_inches="tight")
@@ -211,6 +214,22 @@ def main():
     model.load_state_dict(state)
     model.eval()
 
+    # Sweep ratios
+    sweep_cfg = p_cfg.get("sweep", {}) or {}
+    start = float(sweep_cfg.get("start", 0.0))
+    end = float(sweep_cfg.get("end", 1.0))
+    step = float(sweep_cfg.get("step", 0.05))
+    ratios = make_sweep_ratios(start, end, step)
+    print(f"pruning method: {scheme}")
+    print(f"Pruning Range: [{start}, {end}, {step}]")
+
+    baseline_model = copy.deepcopy(model).to(device)
+    if start > 0.0:
+        warm_pruner = MagnitudePruner(threshold=0.0)
+        warm_pruner.set_parameters({"pruning_threshold": start})
+        baseline_model = warm_pruner.apply_pruning(baseline_model, train_loader=None, device=device)
+        baseline_model.eval()
+
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     results_dir = os.path.join("results", f"{scheme}_pruning_result_figure_{timestamp}")
     os.makedirs(results_dir, exist_ok=True)
@@ -224,6 +243,14 @@ def main():
     base_nonzero, base_total = count_nonzero_params(model)
     base_size_kb = get_model_size_kb(model)
 
+    # Safety guards for normalization
+    eps = 1e-12
+    base_acc = max(base_acc, eps)
+    base_prec = max(base_prec, eps)
+    base_f1 = max(base_f1, eps)
+    base_mcc = max(base_mcc, eps)
+
+
     print(f"Device: {device}")
     print(f"Dataset: {dataset_name}")
     print(f"Model: {arch_name}")
@@ -232,20 +259,12 @@ def main():
     print(f"Baseline | nonzero={base_nonzero}/{base_total} size={base_size_kb:.2f}KB")
     print("-" * 80)
 
-    # Sweep ratios
-    sweep_cfg = p_cfg.get("sweep", {}) or {}
-    start = float(sweep_cfg.get("start", 0.0))
-    end = float(sweep_cfg.get("end", 1.0))
-    step = float(sweep_cfg.get("step", 0.05))
-    ratios = make_sweep_ratios(start, end, step)
-    print(f"pruning method: {scheme}")
-    print(f"Pruning Range: [{start}, {end}, {step}]")
 
     # For FIM-based schemes, optionally use subset loader
     use_fim_loader = scheme in {
         "fim",
-        "magnitude_fim_one_shot",
-        "magnitude_fim_iterative",
+        "f_dist_one_shot",
+        "f_dist_iterative",
         "sqrt_averaged_magnitude_fim",
     }
     if use_fim_loader:
@@ -259,88 +278,172 @@ def main():
     else:
         fim_loader = None
 
-    # Storage for curves
-    ratios_pct = []
-    accs = []
-    precs = []
-    f1s = []
-    mccs = []
+    # Storage for curves and output JSON file
+    results_json = {
+        "metadata": {
+            "scheme": scheme,
+            "dataset": dataset_name,
+            "model": arch_name,
+            "timestamp": timestamp,
+        },
+        "results": {
+            "pruning_ratio": [],
+            "acc_norm": [],
+            "precision_norm": [],
+            "f1_norm": [],
+            "mcc_norm": [],
+        }
+    }
+
 
     # One-shot sweep: to guarantee exact prune ratio semantics (prune ratio of original),
     # we evaluate each ratio from a fresh copy of the baseline model.
     # This avoids ambiguity when zeros accumulate across steps.
-    for r in ratios:
-        pruned_model = copy.deepcopy(model).to(device)
+    if scheme == "f_dist_iterative":
+        pruned_model = copy.deepcopy(baseline_model).to(device)
 
         pruner = build_pruner(config, scheme)
 
-        # Unified dict-style parameter setting
-        if scheme == "magnitude":
-            pruner.set_parameters({"pruning_threshold": r})
-            pruned_model = pruner.apply_pruning(pruned_model, train_loader=None, device=device)
+        pruner.set_parameters({
+            "fim_calculate_method": str(p_cfg.get("fim_calculate_method", "nngeometry")).lower(),
+            "pruning_step": step,
+        })
 
-        elif scheme == "fim":
-            pruner.set_parameters({
-                "pruning_threshold": r,
-                "fim_calculate_method": str(p_cfg.get("fim_calculate_method", "nngeometry")).lower(),
-            })
-            pruned_model = pruner.apply_pruning(pruned_model, train_loader=fim_loader, device=device)
+        for r in ratios:
+            if abs(r - start) < 1e-12:
+                acc = base_acc
+                prec = base_prec
+                f1 = base_f1
+                mcc = base_mcc
+            else:
+                pruned_model = pruner.apply_pruning(
+                    pruned_model,
+                    train_loader=fim_loader,
+                    device=device,
+                )
 
-        elif scheme == "magnitude_fim_one_shot":
-            # assumes its apply_pruning uses its internal thresholds
-            pruner.set_parameters({
-                "pruning_threshold": r,
-                "fim_calculate_method": str(p_cfg.get("fim_calculate_method", "nngeometry")).lower(),
-            })
-            pruned_model = pruner.apply_pruning(pruned_model, train_loader=fim_loader, device=device)
+                # Evaluate
+                acc = evaluate_accuracy(pruned_model, test_loader, device=device)
+                prec = evaluate_precision(pruned_model, test_loader, device=device)
+                f1 = evaluate_f1(pruned_model, test_loader, device=device)
+                mcc = evaluate_mcc(pruned_model, test_loader, device=device)
 
-        elif scheme == "magnitude_fim_iterative":
-            # NOTE: this pruner (as currently written) does iterative internally; it won't give per-step reuse for plotting.
-            # We'll still plot by running one-shot-from-baseline at each ratio for correctness.
-            pruner.set_parameters({
-                "pruning_threshold": r,
-                "iterations": int(p_cfg.get("iterative_pruning_steps", 5)),
-            })
-            pruned_model = pruner.apply_pruning(pruned_model, train_loader=fim_loader, device=device)
+            results_json["results"]["pruning_ratio"].append(r)
+            results_json["results"]["acc_norm"].append(acc / base_acc)
+            results_json["results"]["precision_norm"].append(prec / base_prec)
+            results_json["results"]["f1_norm"].append(f1 / base_f1)
+            results_json["results"]["mcc_norm"].append(mcc / base_mcc)
 
-        elif scheme == "sqrt_averaged_magnitude_fim":
-            pruner.set_parameters(magnitude_threshold=r, fim_threshold=float(p_cfg.get("fim_threshold", 0.8)))
-            pruned_model = pruner.apply_pruning(pruned_model, train_loader=fim_loader, device=device, target_pruning_pct=r)
+            # Print in the format you asked for (and keep extra metrics for debugging)
+            print(f"pruning ratio: {r*100:>5.1f}%, accuracy: {acc*100:.2f}% | precision: {prec:.4f} | f1: {f1:.4f} | mcc: {mcc:.4f}")   
+    else:
+        # code for "magnitude", "fim", "f_dist_one_shot"
+        for r in ratios:
+            pruned_model = copy.deepcopy(baseline_model).to(device)
 
-        else:
-            raise ValueError(f"Unknown scheme: {scheme}")
+            pruner = build_pruner(config, scheme)
 
-        # Evaluate
-        acc = evaluate_accuracy(pruned_model, test_loader, device=device)
-        prec = evaluate_precision(pruned_model, test_loader, device=device)
-        f1 = evaluate_f1(pruned_model, test_loader, device=device)
-        mcc = evaluate_mcc(pruned_model, test_loader, device=device)
+            delta = max(0.0, float(r - start))
 
-        ratios_pct.append(r * 100.0)
-        accs.append(acc * 100.0)
-        precs.append(prec)
-        f1s.append(f1)
-        mccs.append(mcc)
+            # Unified dict-style parameter setting
+            if scheme == "magnitude":
+                pruner.set_parameters({"pruning_threshold": delta})
+                pruned_model = pruner.apply_pruning(pruned_model, train_loader=None, device=device)
 
-        # Print in the format you asked for (and keep extra metrics for debugging)
-        print(f"pruning ratio: {r*100:>5.1f}%, accuracy: {acc*100:.2f}% | precision: {prec:.4f} | f1: {f1:.4f} | mcc: {mcc:.4f}")
+            elif scheme == "fim":
+                pruner.set_parameters({
+                    "pruning_threshold": delta,
+                    "fim_calculate_method": str(p_cfg.get("fim_calculate_method", "nngeometry")).lower(),
+                })
+                pruned_model = pruner.apply_pruning(pruned_model, train_loader=fim_loader, device=device)
+
+            elif scheme == "f_dist_one_shot":
+                # assumes its apply_pruning uses its internal thresholds
+                pruner.set_parameters({
+                    "pruning_threshold": delta,
+                    "fim_calculate_method": str(p_cfg.get("fim_calculate_method", "nngeometry")).lower(),
+                })
+                pruned_model = pruner.apply_pruning(pruned_model, train_loader=fim_loader, device=device)
+
+            elif scheme == "sqrt_averaged_magnitude_fim":
+                pruner.set_parameters(magnitude_threshold=r, fim_threshold=float(p_cfg.get("fim_threshold", 0.8)))
+                pruned_model = pruner.apply_pruning(pruned_model, train_loader=fim_loader, device=device, target_pruning_pct=r)
+
+            else:
+                raise ValueError(f"Unknown scheme: {scheme}")
+
+            # Evaluate
+            acc = evaluate_accuracy(pruned_model, test_loader, device=device)
+            prec = evaluate_precision(pruned_model, test_loader, device=device)
+            f1 = evaluate_f1(pruned_model, test_loader, device=device)
+            mcc = evaluate_mcc(pruned_model, test_loader, device=device)
+
+            results_json["results"]["pruning_ratio"].append(r)
+            results_json["results"]["acc_norm"].append(acc / base_acc)
+            results_json["results"]["precision_norm"].append(prec / base_prec)
+            results_json["results"]["f1_norm"].append(f1 / base_f1)
+            results_json["results"]["mcc_norm"].append(mcc / base_mcc)
+
+
+            # Print in the format you asked for (and keep extra metrics for debugging)
+            print(f"pruning ratio: {r*100:>5.1f}%, accuracy: {acc*100:.2f}% | precision: {prec:.4f} | f1: {f1:.4f} | mcc: {mcc:.4f}")
+
 
     # Plots (4 separate figures)
-    plot_metric(ratios_pct, accs,
-                "Accuracy vs Pruning Ratio", "Accuracy (%)",
+    ratios = results_json["results"]["pruning_ratio"]
+
+    plot_metric(ratios, results_json["results"]["acc_norm"],
+                ylabel="Normalized Accuracy",
                 save_path=os.path.join(results_dir, f"{scheme}_accuracy.png"))
-    plot_metric(ratios_pct, precs,
-                "Precision vs Pruning Ratio", "Precision (macro)",
+
+    plot_metric(ratios, results_json["results"]["precision_norm"],
+                ylabel="Normalized Precision",
                 save_path=os.path.join(results_dir, f"{scheme}_precision.png"))
-    plot_metric(ratios_pct, f1s,
-                "F1-score vs Pruning Ratio", "F1-score (macro)",
+
+    plot_metric(ratios, results_json["results"]["f1_norm"],
+                ylabel="Normalized F1-score",
                 save_path=os.path.join(results_dir, f"{scheme}_f1.png"))
-    plot_metric(ratios_pct, mccs,
-                "MCC vs Pruning Ratio", "MCC",
+
+    plot_metric(ratios, results_json["results"]["mcc_norm"],
+                ylabel="Normalized MCC",
                 save_path=os.path.join(results_dir, f"{scheme}_mcc.png"))
+
+
+    json_path = os.path.join(results_dir, f"{scheme}_results.json")
+    with open(json_path, "w") as f:
+        json.dump(results_json, f, indent=2)
+
+    print(f"Saved results JSON to: {json_path}")
+
 
     print("Done.")
 
 
 if __name__ == "__main__":
     main()
+
+
+
+
+''' Need ?
+results_json = {
+    "metadata": {
+        "scheme": scheme,
+        "dataset": dataset_name,
+        "model": arch_name,
+        "checkpoint": ckpt_path,
+        "timestamp": timestamp,
+    },
+    "baseline": {
+        "accuracy": base_acc,
+        "precision": base_prec,
+        "f1": base_f1,
+        "mcc": base_mcc,
+        "nonzero": base_nonzero,
+        "total": base_total,
+        "size_kb": base_size_kb,
+    },
+    "results": []
+}
+
+'''

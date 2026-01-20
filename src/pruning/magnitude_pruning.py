@@ -91,10 +91,22 @@ class MagnitudePruner(BasePruner):
         elif k_prune >= total:
             mask_global = torch.zeros_like(magnitude_scores, dtype=torch.bool)
         else:
-            prune_idx = torch.topk(magnitude_scores, k=k_prune, largest=False).indices
-            mask_global = torch.ones_like(magnitude_scores, dtype=torch.bool)
-            mask_global[prune_idx] = False
+            active_mask = (all_weights != 0)
+            active_scores = magnitude_scores[active_mask]
+            active_count = int(active_mask.sum().item())
 
+            k_target = int(round(prune_ratio * total))
+            k = min(k_target, active_count)
+
+            if k <= 0:
+                mask_global = torch.ones_like(magnitude_scores, dtype=torch.bool)
+            else:
+                prune_idx_in_active = torch.topk(active_scores, k=k, largest=False).indices
+                active_global_idx = active_mask.nonzero(as_tuple=False).view(-1)
+                prune_idx = active_global_idx[prune_idx_in_active]
+
+                mask_global = torch.ones_like(magnitude_scores, dtype=torch.bool)
+                mask_global[prune_idx] = False
 
         # Apply mask back to each parameter tensor
         offset = 0

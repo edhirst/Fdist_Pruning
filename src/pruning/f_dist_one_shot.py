@@ -12,7 +12,7 @@ except Exception:
 
 from ..utils.fim_calculator import calculate_fim_nngeometry, calculate_fim_backprop
 
-class MagnitudeFIMOneShotPruner(BasePruner):
+class FDistOneShotPruner(BasePruner):
     """
     One-shot pruning combining magnitude and FIM scores.
     Combined score = FIM_diagonal * |weight|
@@ -24,7 +24,6 @@ class MagnitudeFIMOneShotPruner(BasePruner):
         self.threshold = float(self.parameters.get("pruning_threshold", 0.1))
         # Backend selection: "nngeometry" or "backprop"
         self.fim_calculate_method = str(self.parameters.get("fim_calculate_method", "nngeometry")).lower()
-
         self.epsilon = 1e-6
 
     def set_parameters(self, parameters):
@@ -47,67 +46,88 @@ class MagnitudeFIMOneShotPruner(BasePruner):
             return calculate_fim_backprop(model, train_loader, device=device)
         else:
             raise ValueError(
-                f"Unknown fim_backend: {self.fim_calculate_method}. "
+                f"Unknown fim_calculate_method: {self.fim_calculate_method}. "
                 "Supported: 'nngeometry' or 'backprop'."
             )
 
-    def apply_pruning(self, model, train_loader=None, device='cpu'):
+
+    def apply_pruning(self, model, train_loader=None, device="cpu"):
         """
-        Apply one-shot FIM x Magnitude pruning.
-        
-        Args:
-            model: PyTorch model to prune
-            train_loader: DataLoader for FIM computation
-            device: Device for computation
-            
-        Returns:
-            model: Pruned model
+        Incremental one-shot pruning:
+        - threshold means "prune ~threshold * TOTAL params in this call" (delta semantics)
+        - selection is among active (non-zero) weights only
         """
         if train_loader is None:
             raise ValueError("One-shot FIM x Magnitude pruning requires train_loader")
 
-        # Flatten all trainable parameters in a stable order
+        model.to(device)
+
+        # Only trainable params
         params = [p for p in model.parameters() if p.requires_grad]
         if not params:
             print("FIM x Magnitude (One-Shot): no trainable parameters found.")
             return model
 
-        all_weights = torch.cat([p.data.view(-1) for p in params], dim=0)
-        fim_diag = self._calculate_fim(model, train_loader, device=device).to(all_weights.device)
+        # Flatten weights
+        flat_w = torch.cat([p.data.view(-1) for p in params], dim=0).to(device)
+        total = int(flat_w.numel())
 
-        if fim_diag.numel() != all_weights.numel():
+        # Count nonzero before (robust)
+        before_nz = int((flat_w != 0).sum().item())
+
+        # Determine how many to prune in this call (delta fraction of TOTAL)
+        k_target = int(round(float(self.threshold) * total))
+        if k_target <= 0:
+            print(
+                f"FIM x Magnitude (One-Shot): "
+                f"Pruned 0/{total} parameters (0.00%), Remaining {before_nz}"
+            )
+            return model
+
+        # Compute fim_diag aligned with the same flatten order
+        fim_diag = self._calculate_fim(model, train_loader, device=device).to(device)
+        if fim_diag.numel() != total:
             raise ValueError(
-                f"FIM diag length mismatch: fim={fim_diag.numel()} vs weights={all_weights.numel()}. "
-                "Your FIM calculator must return a vector aligned with flattened model.parameters()."
+                f"FIM diag length mismatch: fim={fim_diag.numel()} vs weights={total}. "
+                "Ensure fim_calculator flattens parameters in the same order as model.parameters() (requires_grad only)."
             )
 
         # Combined score
-        combined_scores = torch.sqrt(fim_diag) * all_weights.abs()
+        combined_scores = torch.sqrt(torch.clamp(fim_diag, min=0.0)) * flat_w.abs()
 
-        total = combined_scores.numel()
-        k_prune = int(round(self.threshold * total))
+        # Active-only selection to avoid wasting quota on already-zero weights
+        active_mask = (flat_w != 0)
+        active_count = int(active_mask.sum().item())
+        if active_count == 0:
+            print(
+                f"FIM x Magnitude (One-Shot): "
+                f"Pruned 0/{total} parameters (0.00%), Remaining 0"
+            )
+            return model
 
-        # Build keep-mask: True=keep, False=prune (guarantee exact pruning count)
-        if k_prune <= 0:
-            mask_global = torch.ones_like(combined_scores, dtype=torch.bool)
-        elif k_prune >= total:
-            mask_global = torch.zeros_like(combined_scores, dtype=torch.bool)
-        else:
-            prune_idx = torch.topk(combined_scores, k=k_prune, largest=False).indices
-            mask_global = torch.ones_like(combined_scores, dtype=torch.bool)
-            mask_global[prune_idx] = False
+        k = min(k_target, active_count)
 
-        # Apply mask to each parameter tensor
+        active_scores = combined_scores[active_mask]
+        prune_idx_in_active = torch.topk(active_scores, k=k, largest=False).indices
+        active_global_idx = active_mask.nonzero(as_tuple=False).view(-1)
+        prune_global_idx = active_global_idx[prune_idx_in_active]
+
+        # Apply pruning: set selected weights to zero
+        flat_w[prune_global_idx] = 0.0
+
+        # Write back to parameters
         offset = 0
         for p in params:
-            numel = p.numel()
-            p_mask = mask_global[offset:offset + numel].view_as(p)
-            p.data.mul_(p_mask.to(p.device))
-            offset += numel
+            n = p.numel()
+            p.data.copy_(flat_w[offset:offset + n].view_as(p).to(p.device))
+            offset += n
 
-        # Count pruned parameters
-        pruned_params = (~mask_global).sum().item()
-        remaining = total - pruned_params
+        # Robust reporting: how many nonzero actually dropped
+        after_flat = torch.cat([p.data.view(-1) for p in params], dim=0).to(device)
+        after_nz = int((after_flat != 0).sum().item())
+
+        pruned_params = before_nz - after_nz
+        remaining = after_nz
         pruning_rate = 100.0 * pruned_params / max(total, 1)
 
         print(
@@ -115,4 +135,5 @@ class MagnitudeFIMOneShotPruner(BasePruner):
             f"Pruned {pruned_params}/{total} parameters ({pruning_rate:.2f}%), "
             f"Remaining {remaining}"
         )
+
         return model
