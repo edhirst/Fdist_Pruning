@@ -1,0 +1,30 @@
+{
+  "metadata": {
+    "scheme": "f_dist",
+    "dataset": "mnist",
+    "model": "SimpleNN_h1_w32",
+    "timestamp": "20260123_110450"
+  },
+  "results": {
+    "pruning_ratio": [
+      0.9,
+      1.0
+    ],
+    "acc_norm": [
+      1.0,
+      0.12709116846064064
+    ],
+    "precision_norm": [
+      1.0,
+      0.011742612069931326
+    ],
+    "f1_norm": [
+      1.0,
+      0.023293975326037983
+    ],
+    "mcc_norm": [
+      1.0,
+      0.0
+    ]
+  }
+}
