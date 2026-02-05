@@ -42,9 +42,11 @@ def train_epoch(model, train_loader, criterion, optimizer, device):
         inputs = inputs.to(device)
         labels = labels.to(device)
 
-        optimizer.zero_grad()
+
         outputs = model(inputs)
         loss = criterion(outputs, labels)
+
+        optimizer.zero_grad()
         loss.backward()
         optimizer.step()
         
@@ -79,8 +81,8 @@ def evaluate(model, data_loader, criterion, device):
         total += labels.size(0)
         correct += predicted.eq(labels).sum().item()
 
-    avg_loss = total_loss / max(len(data_loader), 1)
-    accuracy = 100.0 * correct / max(total, 1)
+    avg_loss = total_loss / len(data_loader)
+    accuracy = 100.0 * correct / total
     return avg_loss, accuracy
 
 
@@ -106,14 +108,14 @@ def build_dataloaders(config):
 
 
 def build_model(config):
-    model_cfg = config.get("model", {}) or {}
-    common_cfg = model_cfg.get("common", {}) or {}
+    model_cfg = config.get("model", {})
+    common_cfg = model_cfg.get("common", {})
 
     model_type = common_cfg.get("model_type", "NN")
     num_classes = common_cfg.get("num_classes", 10)
 
     if model_type == "NN":
-        nn_cfg = model_cfg.get("NN", {}) or {}
+        nn_cfg = model_cfg.get("NN", {})
         hidden_size = nn_cfg.get("hidden_size", 32)
         hidden_layers = nn_cfg.get("hidden_layers", 2)
         model = SimpleNN(hidden_size=hidden_size, hidden_layers=hidden_layers, num_classes=num_classes)
@@ -148,12 +150,7 @@ def build_optimizer(config, model):
 
 
 def make_model_filename(config, arch_name: str):
-    tr_cfg = config.get("training", {}) or {}
-    lr = tr_cfg.get("learning_rate", 0.001)
-    bs = tr_cfg.get("batch_size", 128)
-    epochs = tr_cfg.get("num_epochs", 1)
-    opt = tr_cfg.get("optimizer", "adam")
-
+    tr_cfg = config.get("training", {})
     # Example:
     # SimpleNN_h2_n32.pth
     return f"{arch_name}.pth"

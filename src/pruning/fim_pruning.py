@@ -21,7 +21,7 @@ class FIMPruner(BasePruner):
     """
     def __init__(self, parameters=None):
         super().__init__()
-        self.parameters = parameters or {}
+        self.parameters = parameters
         # Quantile threshold: e.g. 0.1 means prune the bottom 10% (keep top 90%)
         self.threshold = float(self.parameters.get("pruning_threshold", 0.1))
         # Backend selection: "nngeometry" or "backprop"

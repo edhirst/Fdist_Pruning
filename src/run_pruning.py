@@ -62,16 +62,16 @@ def build_dataloaders(config):
 
 
 def build_model_from_config(config):
-    model_cfg = config.get("model", {}) or {}
-    common_cfg = model_cfg.get("common", {}) or {}
+    model_cfg = config.get("model", {})
+    common_cfg = model_cfg.get("common", {})
     model_type = common_cfg.get("model_type", "NN")
     num_classes = common_cfg.get("num_classes", 10)
 
     if model_type == "NN":
-        nn_cfg = model_cfg.get("NN", {}) or {}
+        nn_cfg = model_cfg.get("NN", {})
         hidden_size = nn_cfg.get("hidden_size", 32)
         hidden_layers = nn_cfg.get("hidden_layers", 2)
-        model = SimpleNN(hidden_size=hidden_size, hidden_layers=hidden_layers, num_classes=num_classes)
+        model = SimpleNN(hidden_size = hidden_size, hidden_layers = hidden_layers, num_classes = num_classes)
         arch_name = f"SimpleNN_h{hidden_layers}_w{hidden_size}"
     elif model_type == "CNN":
         model = SimpleCNN(num_classes=num_classes)
@@ -137,7 +137,7 @@ def build_pruner(config, scheme: str):
         pruner.set_parameters({...})
         pruner.apply_pruning(model, train_loader=..., device=...)
     """
-    p_cfg = config.get("pruning", {}) or {}
+    p_cfg = config.get("pruning", {})
 
     if scheme == "magnitude":
         return MagnitudePruner(threshold=0.0)
@@ -163,9 +163,9 @@ def build_pruner(config, scheme: str):
 
     if scheme == "f_dist":
         return FDistPruner(parameters={
-            "pruning_step": 0.0,
             "fim_calculate_method": p_cfg.get("fim_calculate_method", "nngeometry"),
             "freeze_all_zero_tensors": True,
+            "f_dist_avg_points": p_cfg.get("f_dist_avg_points", 2)
         })
 
     raise ValueError(f"Unknown pruning_scheme: {scheme}")
@@ -175,13 +175,11 @@ def plot_metric(ratios, values, ylabel, save_path=None):
     plt.figure(figsize=(10, 6))
     plt.plot(ratios, values, marker="o")
     plt.grid(True, alpha=0.5)
-
     plt.xlabel("Pruning ratio", fontdict= {"fontsize": 14})
     plt.ylabel(ylabel, fontdict= {"fontsize": 14})
 
     # normalized metric range
     plt.ylim(-0.05, 1.05)
-
     plt.tight_layout()
     if save_path:
         plt.savefig(save_path, dpi=300, bbox_inches="tight")
@@ -236,12 +234,12 @@ def main():
     print(f"Saving result figures to: {results_dir}")
 
     # Baseline evaluation
-    base_acc = evaluate_accuracy(model, test_loader, device=device)
-    base_prec = evaluate_precision(model, test_loader, device=device)
-    base_f1 = evaluate_f1(model, test_loader, device=device)
-    base_mcc = evaluate_mcc(model, test_loader, device=device)
-    base_nonzero, base_total = count_nonzero_params(model)
-    base_size_kb = get_model_size_kb(model)
+    base_acc = evaluate_accuracy(baseline_model, test_loader, device=device)
+    base_prec = evaluate_precision(baseline_model, test_loader, device=device)
+    base_f1 = evaluate_f1(baseline_model, test_loader, device=device)
+    base_mcc = evaluate_mcc(baseline_model, test_loader, device=device)
+    base_nonzero, base_total = count_nonzero_params(baseline_model)
+    base_size_kb = get_model_size_kb(baseline_model)
 
     # Safety guards for normalization
     eps = 1e-12
@@ -265,7 +263,7 @@ def main():
         "fim",
         "f_dist_one_shot",
         "f_dist_iterative",
-        "sqrt_averaged_magnitude_fim",
+        "f_dist",
     }
     if use_fim_loader:
         fim_subset_size = int(p_cfg.get("fim_subset_size", 0))
@@ -336,6 +334,41 @@ def main():
 
             # Print in the format you asked for (and keep extra metrics for debugging)
             print(f"pruning ratio: {r*100:>5.1f}%, accuracy: {acc*100:.2f}% | precision: {prec:.4f} | f1: {f1:.4f} | mcc: {mcc:.4f}")   
+
+    elif scheme == "f_dist":
+        pruned_model = copy.deepcopy(baseline_model).to(device)
+
+        pruner = build_pruner(config, scheme)
+
+        for r in ratios:
+            if abs(r - start) < 1e-12:
+                acc = base_acc
+                prec = base_prec
+                f1 = base_f1
+                mcc = base_mcc
+            else:
+                pruned_model = pruner.apply_pruning(
+                    pruned_model,
+                    train_loader = fim_loader,
+                    device = device,
+                    target_pruning_pct = r
+                )
+
+                acc = evaluate_accuracy(pruned_model, test_loader, device=device)
+                prec = evaluate_precision(pruned_model, test_loader, device=device)
+                f1 = evaluate_f1(pruned_model, test_loader, device=device)
+                mcc = evaluate_mcc(pruned_model, test_loader, device=device)
+
+            results_json["results"]["pruning_ratio"].append(r)
+            results_json["results"]["acc_norm"].append(acc / base_acc)
+            results_json["results"]["precision_norm"].append(prec / base_prec)
+            results_json["results"]["f1_norm"].append(f1 / base_f1)
+            results_json["results"]["mcc_norm"].append(mcc / base_mcc)
+
+            print(f"pruning ratio: {r*100:>5.1f}%, accuracy: {acc*100:.2f}% | precision: {prec:.4f} | f1: {f1:.4f} | mcc: {mcc:.4f}")
+
+
+            
     else:
         # code for "magnitude", "fim", "f_dist_one_shot"
         for r in ratios:

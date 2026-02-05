@@ -1,5 +1,5 @@
 paths:
-  pretrained_model_path: "models/SimpleNN_h2_n32.pth"
+  pretrained_model_path: "models/SimpleNN_h2_n64.pth"
   dataset_path: "data/"
   model_save_path: "models/"
   log_path: "logs/"
@@ -8,6 +8,7 @@ dataset:
   # Options: "mnist", "fashion_mnist"
   name: "mnist"
 
+# ---------------------- Configuration for training model ----------------------
 model:
   common:
     # Options: "NN", "CNN"
@@ -16,43 +17,43 @@ model:
 
   # Only used when model_type == "NN"
   NN:
-    hidden_size: 32
+    hidden_size: 64
     hidden_layers: 2
 
 training:
-  batch_size: 128
-  num_epochs: 1
+  batch_size: 1024
+  num_epochs: 5
   learning_rate: 0.001
   optimizer: "adam"
 
+
+# ---------------------- Configuration for pruning model ----------------------
 pruning:
   enable_pruning: true # Always True when running pruning.py
-  pruning_scheme: "f_dist_iterative" # Options: magnitude, fim, f_dist_one_shot, f_dist_iterative, sqrt_averaged_magnitude_fim
-  # NOTE: pruning.py currently uses pruning.sweep for evaluation curves.
-  # This field is kept for compatibility and may be used by specific pruners.
+  pruning_scheme: "f_dist" # Options: magnitude, fim, f_dist_one_shot, f_dist_iterative, f_dist
   # pruning_threshold: 0.9
 
   # FIM-related settings (only used by FIM-based schemes)
-  # fim_threshold: 0.8
   fim_subset_size: 500
   fim_subset_seed: 42
   fim_subset_shuffle: true
   fim_calculate_method: "nngeometry" # Options: "nngeometry", "backprop"
-  # Iterative pruning settings (only used by iterative schemes)
-  iterative_pruning_steps: 5
   # Sweep settings (pruning.py uses this to generate pruning ratios)
   sweep:
     start: 0.0
     end: 1.0
     step: 0.2
 
+  f_dist_avg_points: 2
+
 evaluation: 
   # Basic metrics 
   metrics: 
     - accuracy 
     - loss 
-    - mcc 
     - precision 
+    - f1-score
+    - mcc
   validation_split: 0.2 
   
 # Cross-validation settings 
@@ -83,3 +84,5 @@ plots:
 # - 0.001: very conservative (prunes very few weights) 
 # - 0.01: moderate (good starting point) 
 # - 0.1: aggressive (prunes many weights)
+
+# bash script
