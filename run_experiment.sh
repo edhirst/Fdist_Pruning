@@ -8,6 +8,10 @@ BASE_CONFIG=${BASE_CONFIG:-src/config.yaml}
 TRAIN_MODULE=${TRAIN_MODULE:-src.train_model}
 PRUNE_MODULE=${PRUNE_MODULE:-src.run_pruning}
 
+# Set PARALLEL_FOLDS=true to run folds in parallel (uses more RAM)
+# Set PARALLEL_FOLDS=false or unset to run sequentially (default)
+PARALLEL_FOLDS=${PARALLEL_FOLDS:-false}
+
 # ========================
 
 # Read num_folds from config
@@ -19,9 +23,15 @@ PY
 )
 
 echo "Cross-validation folds: ${NUM_FOLDS}"
+if [[ "$PARALLEL_FOLDS" == "true" ]]; then
+  echo "Mode: PARALLEL (all folds run simultaneously - requires ${NUM_FOLDS}x RAM)"
+else
+  echo "Mode: SEQUENTIAL (folds run one at a time)"
+fi
 echo
 
-for fold in $(seq 1 "$NUM_FOLDS"); do
+run_fold() {
+  local fold=$1
   echo "======================================================================"
   echo "==================== FOLD ${fold}/${NUM_FOLDS} ===================="
   echo "======================================================================"
@@ -108,7 +118,23 @@ PY
 
   echo "Fold ${fold}/${NUM_FOLDS} complete."
   echo
-done
+}
+
+# Run folds either in parallel or sequentially
+if [[ "$PARALLEL_FOLDS" == "true" ]]; then
+  # Parallel execution: launch all folds as background jobs
+  for fold in $(seq 1 "$NUM_FOLDS"); do
+    run_fold "$fold" &
+  done
+  
+  # Wait for all background jobs to complete
+  wait
+else
+  # Sequential execution: run one fold at a time
+  for fold in $(seq 1 "$NUM_FOLDS"); do
+    run_fold "$fold"
+  done
+fi
 
 echo "All done."
 echo "Completed ${NUM_FOLDS} fold(s)."
