@@ -414,10 +414,6 @@ def main():
                 })
                 pruned_model = pruner.apply_pruning(pruned_model, train_loader=fim_loader, device=device)
 
-            elif scheme == "sqrt_averaged_magnitude_fim":
-                pruner.set_parameters(magnitude_threshold=r, fim_threshold=float(p_cfg.get("fim_threshold", 0.8)))
-                pruned_model = pruner.apply_pruning(pruned_model, train_loader=fim_loader, device=device, target_pruning_pct=r)
-
             else:
                 raise ValueError(f"Unknown scheme: {scheme}")
 
