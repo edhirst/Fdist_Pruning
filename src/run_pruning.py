@@ -171,7 +171,7 @@ def build_pruner(config, scheme: str):
     raise ValueError(f"Unknown pruning_scheme: {scheme}")
 
 
-def plot_metric(ratios, values, ylabel, save_path=None):
+def plot_metric(ratios, values, ylabel, save_path=None, dpi=300):
     plt.figure(figsize=(10, 6))
     plt.plot(ratios, values, marker="o")
     plt.grid(True, alpha=0.5)
@@ -182,7 +182,7 @@ def plot_metric(ratios, values, ylabel, save_path=None):
     plt.ylim(-0.05, 1.05)
     plt.tight_layout()
     if save_path:
-        plt.savefig(save_path, dpi=300, bbox_inches="tight")
+        plt.savefig(save_path, dpi=dpi, bbox_inches="tight")
     plt.close()
 
 
@@ -228,10 +228,26 @@ def main():
         baseline_model = warm_pruner.apply_pruning(baseline_model, train_loader=None, device=device)
         baseline_model.eval()
 
+    # Get plot configuration
+    plot_cfg = config.get("plots", {}) or {}
+    save_plots = bool(plot_cfg.get("save_plots", True))
+    plot_formats = plot_cfg.get("plot_formats", ["png"])
+    plot_dpi = plot_cfg.get("dpi", 300)
+    if plot_dpi is None:
+        plot_dpi = 300
+
+    # Get fold info for directory naming
+    cv_cfg = config.get("cross_validation", {}) or {}
+    current_fold = cv_cfg.get("current_fold", None)
+    
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    results_dir = os.path.join("results", f"{scheme}_pruning_result_figure_{timestamp}")
+    fold_suffix = f"_fold{current_fold}" if current_fold is not None else ""
+    results_dir = os.path.join("results", f"{scheme}_pruning_result_figure_{timestamp}{fold_suffix}")
     os.makedirs(results_dir, exist_ok=True)
-    print(f"Saving result figures to: {results_dir}")
+    if save_plots:
+        print(f"Saving result figures to: {results_dir}")
+    else:
+        print(f"Plot saving disabled (save_plots=False). Results JSON only: {results_dir}")
 
     # Baseline evaluation
     base_acc = evaluate_accuracy(baseline_model, test_loader, device=device)
@@ -425,21 +441,19 @@ def main():
     # Plots (4 separate figures)
     ratios = results_json["results"]["pruning_ratio"]
 
-    plot_metric(ratios, results_json["results"]["acc_norm"],
-                ylabel="Normalized Accuracy",
-                save_path=os.path.join(results_dir, f"{scheme}_accuracy.png"))
+    if save_plots:
+        metrics = [
+            ("acc_norm", "Normalized Accuracy", "accuracy"),
+            ("precision_norm", "Normalized Precision", "precision"),
+            ("f1_norm", "Normalized F1-score", "f1"),
+            ("mcc_norm", "Normalized MCC", "mcc"),
+        ]
 
-    plot_metric(ratios, results_json["results"]["precision_norm"],
-                ylabel="Normalized Precision",
-                save_path=os.path.join(results_dir, f"{scheme}_precision.png"))
-
-    plot_metric(ratios, results_json["results"]["f1_norm"],
-                ylabel="Normalized F1-score",
-                save_path=os.path.join(results_dir, f"{scheme}_f1.png"))
-
-    plot_metric(ratios, results_json["results"]["mcc_norm"],
-                ylabel="Normalized MCC",
-                save_path=os.path.join(results_dir, f"{scheme}_mcc.png"))
+        for metric_key, ylabel, metric_name in metrics:
+            for fmt in plot_formats:
+                save_path = os.path.join(results_dir, f"{scheme}_{metric_name}.{fmt}")
+                plot_metric(ratios, results_json["results"][metric_key],
+                           ylabel=ylabel, save_path=save_path, dpi=plot_dpi)
 
 
     json_path = os.path.join(results_dir, f"{scheme}_results.json")
