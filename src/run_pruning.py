@@ -455,28 +455,3 @@ def main():
 if __name__ == "__main__":
     main()
 
-
-
-
-''' Need ?
-results_json = {
-    "metadata": {
-        "scheme": scheme,
-        "dataset": dataset_name,
-        "model": arch_name,
-        "checkpoint": ckpt_path,
-        "timestamp": timestamp,
-    },
-    "baseline": {
-        "accuracy": base_acc,
-        "precision": base_prec,
-        "f1": base_f1,
-        "mcc": base_mcc,
-        "nonzero": base_nonzero,
-        "total": base_total,
-        "size_kb": base_size_kb,
-    },
-    "results": []
-}
-
-'''
