@@ -21,8 +21,8 @@ model:
     hidden_layers: 2
 
 training:
-  batch_size: 1024
-  num_epochs: 25
+  batch_size: 128
+  num_epochs: 5
   learning_rate: 0.001
   optimizer: "adam"
 
@@ -30,7 +30,7 @@ training:
 # ---------------------- Configuration for pruning model ----------------------
 pruning:
   enable_pruning: true # Always True when running pruning.py
-  pruning_scheme: "magnitude" # Options: magnitude, fim, f_dist_one_shot, f_dist_iterative, f_dist
+  pruning_scheme: "fim" # Options: magnitude, fim, f_dist_one_shot, f_dist_iterative, f_dist
   # pruning_threshold: 0.9
 
   # FIM-related settings (only used by FIM-based schemes)

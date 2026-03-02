@@ -15,9 +15,14 @@ Code for implementation of the novel Fisher-distance pruning scheme, with its ap
 
 1. Configure the parameters in the `config/config.yaml`, `config/datasets.yaml`, `config/models.yaml`, and `config/pruning.yaml` files according to your needs.
 
-2. Run the main script to start training:
+2. Run the `train_model` script to start training a new model:
    ```
-   python src/main.py
+   python -m src.train_model
+   ```
+
+3. Run the `run_pruning` script to start pruning the model:
+   ```
+   python -m src.run_pruning
    ```
 
 ## Pruning Schemes

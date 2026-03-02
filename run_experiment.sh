@@ -110,14 +110,14 @@ PY
   rm -f "$CFG_FDIST_IT"
   echo
 
-  echo "==[6/6] Run F_DIST (Fisher-distance) pruning =="
-  CFG_FDIST=$(make_tmp_cfg "f_dist")
-  $PYTHON -m "$PRUNE_MODULE" "$CFG_FDIST"
-  rm -f "$CFG_FDIST"
-  echo
+  # echo "==[6/6] Run F_DIST (Fisher-distance) pruning =="
+  # CFG_FDIST=$(make_tmp_cfg "f_dist")
+  # $PYTHON -m "$PRUNE_MODULE" "$CFG_FDIST"
+  # rm -f "$CFG_FDIST"
+  # echo
 
-  echo "Fold ${fold}/${NUM_FOLDS} complete."
-  echo
+  # echo "Fold ${fold}/${NUM_FOLDS} complete."
+  # echo
 }
 
 # Run folds either in parallel or sequentially
