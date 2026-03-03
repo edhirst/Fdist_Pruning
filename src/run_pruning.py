@@ -48,13 +48,15 @@ def get_device():
 def build_dataloaders(config):
     dataset_name = config.get("dataset", {}).get("name", "mnist").lower()
     batch_size = config["training"]["batch_size"]
+    num_workers = int(config.get("training", {}).get("num_workers", 4))
+    pin_memory = bool(config.get("training", {}).get("pin_memory", True))
 
     if dataset_name == "mnist":
-        train_loader = load_mnist(batch_size=batch_size, train=True, download=True)
-        test_loader = load_mnist(batch_size=batch_size, train=False, download=True)
+        train_loader = load_mnist(batch_size=batch_size, train=True, download=True, num_workers=num_workers, pin_memory=pin_memory)
+        test_loader = load_mnist(batch_size=batch_size, train=False, download=True, num_workers=num_workers, pin_memory=pin_memory)
     elif dataset_name == "fashion_mnist":
-        train_loader = load_fashion_mnist(batch_size=batch_size, train=True, download=True)
-        test_loader = load_fashion_mnist(batch_size=batch_size, train=False, download=True)
+        train_loader = load_fashion_mnist(batch_size=batch_size, train=True, download=True, num_workers=num_workers, pin_memory=pin_memory)
+        test_loader = load_fashion_mnist(batch_size=batch_size, train=False, download=True, num_workers=num_workers, pin_memory=pin_memory)
     else:
         raise ValueError(f"Unknown dataset: {dataset_name}")
 
@@ -128,7 +130,10 @@ def make_fim_loader_subset(train_loader, subset_size: int, seed: int, shuffle: b
         idx = list(range(subset_size))
 
     subset = Subset(dataset, idx)
-    return DataLoader(subset, batch_size=train_loader.batch_size, shuffle=False, num_workers=0)
+    nw = train_loader.num_workers
+    pm = train_loader.pin_memory
+    return DataLoader(subset, batch_size=train_loader.batch_size, shuffle=False,
+                      num_workers=nw, pin_memory=pm, persistent_workers=(nw > 0))
 
 
 def build_pruner(config, scheme: str):

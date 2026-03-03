@@ -93,13 +93,15 @@ def build_dataloaders(config):
     """
     dataset_name = config.get("dataset", {}).get("name", "mnist").lower()
     batch_size = config["training"]["batch_size"]
+    num_workers = int(config.get("training", {}).get("num_workers", 4))
+    pin_memory = bool(config.get("training", {}).get("pin_memory", True))
 
     if dataset_name == "mnist":
-        train_loader = load_mnist(batch_size=batch_size, train=True, download=True)
-        test_loader = load_mnist(batch_size=batch_size, train=False, download=True)
+        train_loader = load_mnist(batch_size=batch_size, train=True, download=True, num_workers=num_workers, pin_memory=pin_memory)
+        test_loader = load_mnist(batch_size=batch_size, train=False, download=True, num_workers=num_workers, pin_memory=pin_memory)
     elif dataset_name == "fashion_mnist":
-        train_loader = load_fashion_mnist(batch_size=batch_size, train=True, download=True)
-        test_loader = load_fashion_mnist(batch_size=batch_size, train=False, download=True)
+        train_loader = load_fashion_mnist(batch_size=batch_size, train=True, download=True, num_workers=num_workers, pin_memory=pin_memory)
+        test_loader = load_fashion_mnist(batch_size=batch_size, train=False, download=True, num_workers=num_workers, pin_memory=pin_memory)
     else:
         raise ValueError(f"Unknown dataset: {dataset_name}")
 

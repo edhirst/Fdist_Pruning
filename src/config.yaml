@@ -25,6 +25,8 @@ training:
   num_epochs: 25
   learning_rate: 0.001
   optimizer: "adam"
+  num_workers: 4      # parallel DataLoader workers; set 0 on Windows or if using fork-unsafe libs
+  pin_memory: true    # faster CPU→GPU transfers; set false if running on CPU-only
 
 
 # ---------------------- Configuration for pruning model ----------------------
