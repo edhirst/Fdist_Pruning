@@ -1,5 +1,4 @@
 from .data_loader import load_mnist, load_fashion_mnist
-from .metrics import calculate_accuracy, calculate_loss, log_metrics
 from .evaluation import (
     calculate_auc, evaluate_accuracy, evaluate_precision,
     evaluate_f1, evaluate_mcc,

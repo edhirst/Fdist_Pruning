@@ -21,8 +21,8 @@ model:
     hidden_layers: 2
 
 training:
-  batch_size: 1024
-  num_epochs: 25
+  batch_size: 128
+  num_epochs: 5
   learning_rate: 0.001
   optimizer: "adam"
   num_workers: 4      # parallel DataLoader workers; set 0 on Windows or if using fork-unsafe libs
@@ -32,7 +32,7 @@ training:
 # ---------------------- Configuration for pruning model ----------------------
 pruning:
   enable_pruning: true # Always True when running pruning.py
-  pruning_scheme: "f_dist" # Options: magnitude, fim, f_dist_one_shot, f_dist_iterative, f_dist
+  pruning_scheme: "fim" # Options: magnitude, fim, f_dist_one_shot, f_dist_iterative, f_dist
   # pruning_threshold: 0.9
 
   # FIM-related settings (only used by FIM-based schemes)
@@ -46,7 +46,7 @@ pruning:
     end: 1.0
     step: 0.05
 
-  f_dist_avg_points: 2
+  f_dist_avg_points: 5 # 
 
 evaluation: 
   # Basic metrics 
