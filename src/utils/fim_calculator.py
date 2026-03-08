@@ -136,9 +136,9 @@ def _fisher_diag_for_one_tensor(model, dataloader, device, tensor_name: str):
     # Gradient of log p(c|x) wrt parameters (only tensor_name will carry grad)
     grad_logp_class = grad(lambda pr, x, c: _logp_of_class(pr, buffers, model, x, c))
 
-    # Initialize accumulator on CPU
+    # Keep accumulator on the compute device to avoid per-batch GPU→CPU transfers
     target_shape = base_params[tensor_name].shape
-    acc = torch.zeros(target_shape, device="cpu")
+    acc = torch.zeros(target_shape, device=device)
 
     seen = 0
     for xb, _ in dataloader:
@@ -156,7 +156,7 @@ def _fisher_diag_for_one_tensor(model, dataloader, device, tensor_name: str):
                 return grad_logp_class(pr2, x_single.unsqueeze(0), c_long)
             return vmap(grad_one, in_dims=(None, 0))(pr, x)  # dict -> [B, ...param_shape...]
 
-        Eg2_batchsum = torch.zeros_like(acc, device=xb.device)
+        Eg2_batchsum = torch.zeros(target_shape, device=device)
 
         for c in range(C):
             c_long = torch.tensor(c, device=xb.device, dtype=torch.long)
@@ -166,11 +166,11 @@ def _fisher_diag_for_one_tensor(model, dataloader, device, tensor_name: str):
             w = probs[:, c].reshape(B, *([1] * (g2_B.ndim - 1)))  # [B, 1, 1, ...]
             Eg2_batchsum += (w * g2_B).sum(dim=0)       # [...]
 
-        acc += Eg2_batchsum.detach().cpu()
+        acc += Eg2_batchsum.detach()
         seen += B
 
     _restore_requires_grad(model, old_flags)
-    return acc / float(max(seen, 1))
+    return (acc / float(max(seen, 1))).cpu()
 
 
 
