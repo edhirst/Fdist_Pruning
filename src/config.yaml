@@ -37,7 +37,7 @@ pruning:
   fim_subset_size: 500
   fim_subset_seed: 42
   fim_subset_shuffle: true
-  fim_calculate_method: "nngeometry" # Options: "nngeometry", "backprop"
+  fim_calculate_method: "backprop" # Options: "nngeometry", "backprop"
   # Sweep settings (pruning.py uses this to generate pruning ratios)
   sweep:
     start: 0.0
