@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# 固定在 repo root
+# fix in repo's root
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$ROOT_DIR"
 
@@ -11,7 +11,7 @@ CONFIG="src/config.yaml"
 echo "Running from: $ROOT_DIR"
 echo
 
-# 讀 checkpoint 路徑
+# Read the file path
 CKPT_PATH=$($PYTHON - <<PY
 import yaml
 cfg = yaml.safe_load(open("${CONFIG}", "r"))
@@ -24,7 +24,6 @@ echo "Checkpoint path: $CKPT_PATH"
 if [[ ! -f "$CKPT_PATH" ]]; then
   echo "ERROR: checkpoint not found."
   echo "Expected file: $CKPT_PATH"
-  echo "請確認 models/ 下面真的有這個檔案"
   exit 1
 fi
 
