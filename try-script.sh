@@ -73,11 +73,11 @@ $PYTHON -m src.run_pruning "$CFG_FDI"
 rm -f "$CFG_FDI"
 echo
 
-# echo "== Pruning: fdist =="
-# CFG_FD="$(make_prune_cfg f_dist)"
-# $PYTHON -m src.run_pruning "$CFG_FD"
-# rm -f "$CFG_FD"
-# echo
+echo "== Pruning: fdist =="
+CFG_FD="$(make_prune_cfg f_dist)"
+$PYTHON -m src.run_pruning "$CFG_FD"
+rm -f "$CFG_FD"
+echo
 
 
 

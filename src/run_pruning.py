@@ -28,7 +28,7 @@ from .pruning.f_dist import FDistPruner
 
 # load config from yaml
 def load_config(config_path: str):
-    with open(config_path, "r") as file:
+    with open(config_path, "r", encoding='utf-8') as file:
         config = yaml.safe_load(file)
     
     return config
@@ -255,12 +255,12 @@ def main():
         print(f"Plot saving disabled (save_plots=False). Results JSON only: {results_dir}")
 
     # Baseline evaluation
-    base_acc = evaluate_accuracy(baseline_model, test_loader, device=device)
-    base_prec = evaluate_precision(baseline_model, test_loader, device=device)
-    base_f1 = evaluate_f1(baseline_model, test_loader, device=device)
-    base_mcc = evaluate_mcc(baseline_model, test_loader, device=device)
-    base_nonzero, base_total = count_nonzero_params(baseline_model)
-    base_size_kb = get_model_size_kb(baseline_model)
+    base_acc = evaluate_accuracy(model, test_loader, device=device)
+    base_prec = evaluate_precision(model, test_loader, device=device)
+    base_f1 = evaluate_f1(model, test_loader, device=device)
+    base_mcc = evaluate_mcc(model, test_loader, device=device)
+    base_nonzero, base_total = count_nonzero_params(model)
+    base_size_kb = get_model_size_kb(model)
 
     # Safety guards for normalization
     eps = 1e-12
@@ -330,10 +330,10 @@ def main():
 
         for r in ratios:
             if abs(r - start) < 1e-12:
-                acc = base_acc
-                prec = base_prec
-                f1 = base_f1
-                mcc = base_mcc
+                acc = evaluate_accuracy(pruned_model, test_loader, device=device)
+                prec = evaluate_precision(pruned_model, test_loader, device=device)
+                f1 = evaluate_f1(pruned_model, test_loader, device=device)
+                mcc = evaluate_mcc(pruned_model, test_loader, device=device)
             else:
                 pruned_model = pruner.apply_pruning(
                     pruned_model,
@@ -361,18 +361,22 @@ def main():
 
         pruner = build_pruner(config, scheme)
 
+        pruner.set_parameters({
+            "fim_calculate_method": str(p_cfg.get("fim_calculate_method", "nngeometry")).lower(),
+            "pruning_step": step,
+        })
+
         for r in ratios:
             if abs(r - start) < 1e-12:
-                acc = base_acc
-                prec = base_prec
-                f1 = base_f1
-                mcc = base_mcc
+                acc = evaluate_accuracy(pruned_model, test_loader, device=device)
+                prec = evaluate_precision(pruned_model, test_loader, device=device)
+                f1 = evaluate_f1(pruned_model, test_loader, device=device)
+                mcc = evaluate_mcc(pruned_model, test_loader, device=device)
             else:
                 pruned_model = pruner.apply_pruning(
                     pruned_model,
                     train_loader = fim_loader,
-                    device = device,
-                    target_pruning_pct = r
+                    device = device
                 )
 
                 acc = evaluate_accuracy(pruned_model, test_loader, device=device)

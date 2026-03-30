@@ -32,11 +32,30 @@ class FDistPruner(BasePruner):
     def __init__(self, parameters=None):
         super().__init__()
         self.parameters = parameters or {}
+        # delta per step
+        self.step = float(self.parameters.get("pruning_step", 0.0))
+        # clamp to [0,1]
+        self.step = max(0.0, min(1.0, self.step))
         self.freeze_all_zero_tensors = bool(self.parameters.get("freeze_all_zero_tensors", True))
         self.fim_calculate_method = str(self.parameters.get("fim_calculate_method", "nngeometry")).lower()
         self.f_dist_avg_points = int(self.parameters.get("f_dist_avg_points", 2))
         if self.f_dist_avg_points < 2:
             raise ValueError(f"f_dist average points must be >= 2, got {self.f_dist_avg_points}")
+
+        # cached total prunable params (trainable params) for delta->count conversion
+        self._total_params = None
+
+    def set_parameters(self, parameters):
+        self.parameters = parameters or {}
+
+        # delta per step
+        self.step = float(self.parameters.get("pruning_step", 0.0))
+        # clamp to [0,1]
+        self.step = max(0.0, min(1.0, self.step))
+
+        self.fim_calculate_method = str(
+            self.parameters.get("fim_calculate_method", self.parameters.get("fim_backend", "nngeometry"))
+        ).lower()
 
     def _calculate_fim(self, model, train_loader, device="cpu"):
         """
@@ -66,6 +85,18 @@ class FDistPruner(BasePruner):
             chunks.append(torch.full((p.numel(),), bool(p.requires_grad), dtype=torch.bool))
         return torch.cat(chunks, dim=0)
 
+    @staticmethod
+    def _count_nonzero_and_total_prunable(model):
+        nonzero = 0
+        total = 0
+        for p in model.parameters():
+            if not p.requires_grad:
+                continue
+            t = p.data
+            total += t.numel()
+            nonzero += (t != 0).sum().item()
+        return int(nonzero), int(total)
+    
     def calculate_fim_avg(self, model, train_loader, device):
         model_cp = copy.deepcopy(model).to(device)
 
@@ -114,7 +145,7 @@ class FDistPruner(BasePruner):
                 with torch.no_grad():
                     param.view(-1)[local_i] = float(a) * w0
 
-                F_tmp = torch.sqrt(self._calculate_fim(model_cp, train_loader, device).detach().cpu())
+                F_tmp = self._calculate_fim(model_cp, train_loader, device).detach()
                 acc += float(F_tmp[idx].item())
 
             with torch.no_grad():
@@ -124,20 +155,33 @@ class FDistPruner(BasePruner):
 
         return F_avg  # CPU 1D
 
-    def apply_pruning(self, model, train_loader=None, device="cpu", target_pruning_pct=None):
+    def apply_pruning(self, model, train_loader=None, device="cpu",):
         if train_loader is None:
             raise ValueError("FDistPruner requires train_loader")
-        if target_pruning_pct is None:
-            raise ValueError("FDistPruner requires target_pruning_pct (cumulative pruning ratio in [0,1]).")
-
-        r = float(target_pruning_pct)
-        if not (0.0 <= r <= 1.0):
-            raise ValueError(f"target_pruning_pct must be in [0,1], got {r}")
-
+        
+        before_nz, total_params_runtime = self._count_nonzero_and_total_prunable(model)
+        if total_params_runtime == 0:
+            print("f_dist iterative: Pruned 0/0 parameters (0.00%), Remaining 0")
+            return model
+        
         model.to(device)
 
+        # cache total prunable params once
+        if self._total_params is None:
+            self._total_params = int(total_params_runtime)
 
-        F_sqrt_avg_all = self.calculate_fim_avg(model, train_loader=train_loader, device=device)  
+        # each call prunes a fixed delta w.r.t. total prunable params
+        k_prune_target = int(round(float(self.step) * self._total_params))
+
+        if k_prune_target <= 0:
+            print(
+                f"f_dist iterative: Pruned 0/{total_params_runtime} parameters (0.00%), "
+                f"Remaining {before_nz}"
+            )
+            return model
+
+        # recompute F_sqrt_avg on current model state
+        F_sqrt_avg_all = torch.sqrt(self.calculate_fim_avg(model, train_loader=train_loader, device=device))  
 
         # Flatten abs/weights over ALL params, build requires_grad mask
         all_abs, all_w = [], []
@@ -154,46 +198,35 @@ class FDistPruner(BasePruner):
         Wabs = all_abs_vec[grad_mask_all]
         w_flat = all_w_vec[grad_mask_all].clone()
 
-        total = int(F.numel())
-        if total == 0:
-            print("f_dist: Pruned 0/0 parameters (0.00%), Remaining 0")
-            return model
-
-        current_zeros = int((w_flat == 0).sum().item())
-        target_zeros = int(round(r * total))
-        target_zeros = max(0, min(target_zeros, total))
-
-        need_to_prune = target_zeros - current_zeros
-        if need_to_prune <= 0:
-            remaining = total - current_zeros
-            print(f"f_dist: Pruned 0/{total} parameters (0.00%), Remaining {remaining}")
-            return model
-
-        # F_dist
-        importance = F * Wabs
+        if F.numel() != w_flat.numel():
+            raise ValueError(
+                f"F_sqrt_avg length mismatch: fim={F.numel()} vs weights={w_flat.numel()}. "
+                "Ensure calculate_fim_avg aligns with model.parameters() flatten order."
+            )
 
         # prune only among active weights
         active_mask = (w_flat != 0)
         active_count = int(active_mask.sum().item())
-        k = min(int(need_to_prune), active_count)
+        k_prune = min(k_prune_target, active_count)
 
-        if k <= 0:
-            remaining = total - current_zeros
-            print(f"f_dist: Pruned 0/{total} parameters (0.00%), Remaining {remaining}")
+        if k_prune <= 0:
+            print(
+                f"f_dist iterative: Pruned 0/{total_params_runtime} parameters (0.00%), "
+                f"Remaining {before_nz}"
+            )
             return model
 
+
+        # F_dist
+        importance = F * Wabs
+
         active_scores = importance[active_mask]
-        prune_idx_in_active = torch.topk(active_scores, k=k, largest=False).indices
+        prune_idx_in_active = torch.topk(active_scores, k=k_prune, largest=False).indices
         active_global_idx = active_mask.nonzero(as_tuple=False).view(-1)
         prune_global_idx = active_global_idx[prune_idx_in_active]
 
-        before_nz = int((w_flat != 0).sum().item())
+                # apply pruning
         w_flat[prune_global_idx] = 0.0
-        after_nz = int((w_flat != 0).sum().item())
-
-        pruned_params = before_nz - after_nz
-        remaining = after_nz
-        pruning_rate = 100.0 * pruned_params / max(total, 1)
 
         # write back: scatter into full vector, then copy into parameters
         full_vec = all_w_vec.clone()
@@ -206,8 +239,15 @@ class FDistPruner(BasePruner):
                 p.copy_(full_vec[offset:offset + n].view_as(p).to(p.device))
                 offset += n
 
+        # Count after pruning
+        after_nz, _ = self._count_nonzero_and_total_prunable(model)
+        pruned_params = before_nz - after_nz
+        remaining = after_nz
+        pruning_rate = 100.0 * pruned_params / max(total_params_runtime, 1)
+
         print(
-            f"f_dist: Pruned {pruned_params}/{total} parameters ({pruning_rate:.2f}%), "
+            f"f_dist iterative: "
+            f"Pruned {pruned_params}/{total_params_runtime} parameters ({pruning_rate:.2f}%), "
             f"Remaining {remaining}"
         )
         return model
