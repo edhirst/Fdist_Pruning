@@ -41,9 +41,9 @@ pruning:
   fim_calculate_method: "backprop" # Options: "nngeometry", "backprop"
   # Sweep settings (pruning.py uses this to generate pruning ratios)
   sweep:
-    start: 0.0
+    start: 0.8
     end: 1.0
-    step: 0.02
+    step: 0.05
 
   f_dist_avg_points: 2 # 
 
