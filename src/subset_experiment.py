@@ -10,9 +10,9 @@ from scipy.stats import spearmanr
 from nngeometry import FIM
 from nngeometry.object import PMatDiag
 
-from .utils.data_loader import load_mnist, load_fashion_mnist
-from .models.simple_cnn import SimpleCNN
-from .models.simple_nn import SimpleNN
+from .utils.data_loader import build_dataloaders
+from .utils.model_builder import build_model_from_config, get_model_type, resolve_checkpoint_path
+from .utils.fim_calculator import calculate_fim_backprop
 
 
 # ------------------------- Config / Device ------------------------- #
@@ -28,45 +28,6 @@ def get_device():
     if getattr(torch.backends, "mps", None) is not None and torch.backends.mps.is_available():
         return torch.device("mps")
     return torch.device("cpu")
-
-
-# ------------------------- Data / Model ------------------------- #
-
-def build_dataloaders(config):
-    dataset_name = config.get("dataset", {}).get("name", "mnist").lower()
-    batch_size = config["training"]["batch_size"]
-
-    if dataset_name == "mnist":
-        train_loader = load_mnist(batch_size=batch_size, train=True, download=True)
-        test_loader = load_mnist(batch_size=batch_size, train=False, download=True)
-    elif dataset_name == "fashion_mnist":
-        train_loader = load_fashion_mnist(batch_size=batch_size, train=True, download=True)
-        test_loader = load_fashion_mnist(batch_size=batch_size, train=False, download=True)
-    else:
-        raise ValueError(f"Unknown dataset: {dataset_name}")
-
-    return dataset_name, train_loader, test_loader
-
-
-def build_model_from_config(config):
-    model_cfg = config.get("model", {})
-    common_cfg = model_cfg.get("common", {})
-    model_type = common_cfg.get("model_type", "NN")
-    num_classes = common_cfg.get("num_classes", 10)
-
-    if model_type == "NN":
-        nn_cfg = model_cfg.get("NN", {})
-        hidden_size = nn_cfg.get("hidden_size", 32)
-        hidden_layers = nn_cfg.get("hidden_layers", 2)
-        model = SimpleNN(hidden_size=hidden_size, hidden_layers=hidden_layers, num_classes=num_classes)
-        arch_name = f"SimpleNN_h{hidden_layers}_w{hidden_size}"
-    elif model_type == "CNN":
-        model = SimpleCNN(num_classes=num_classes)
-        arch_name = "SimpleCNN"
-    else:
-        raise ValueError(f"Unknown model_type: {model_type}")
-
-    return model, arch_name
 
 
 def make_subset_loader(train_loader: DataLoader, subset_size: int, seed: int):
@@ -101,14 +62,20 @@ def freeze_all_zero_tensors(model: torch.nn.Module):
             p.requires_grad_(False)
 
 
-def compute_fim_diag_pmatdiag(model, loader, device, freeze_zero_tensors: bool):
+def compute_fim_diag_pmatdiag(model, loader, device, freeze_zero_tensors: bool, method: str = "pmatdiag"):
     """
+    Fisher diagonal for the convergence diagnostic.
+    method='pmatdiag' uses nngeometry (NN/CNN only); method='backprop' uses the
+    torch.func class-marginal Fisher (required for transformer models).
     """
     model = model.to(device)
     model.eval()
 
     if freeze_zero_tensors:
         freeze_all_zero_tensors(model)
+
+    if method == "backprop":
+        return calculate_fim_backprop(model, loader, device=device)
 
     fim_obj = FIM(
         model=model,
@@ -127,15 +94,15 @@ def main():
     config = load_config(config_path)
 
     device = get_device()
-    dataset_name, train_loader, _ = build_dataloaders(config)
+    dataset_name, train_loader, _ = build_dataloaders(config, augment=False)
 
     # model + checkpoint
-    model, arch_name = build_model_from_config(config)
+    model, arch_name = build_model_from_config(config, dataset_name=dataset_name)
     model = model.to(device)
 
-    ckpt_path = (config.get("paths", {}) or {}).get("pretrained_model_path", None)
-    if not ckpt_path:
-        raise ValueError("Missing config: paths.pretrained_model_path")
+    ckpt_path = resolve_checkpoint_path(config, arch_name, dataset_name)
+    if not os.path.isfile(ckpt_path):
+        raise FileNotFoundError(f"Checkpoint not found: {ckpt_path}. Train it first: python -m src.train_model")
 
     # PyTorch warning 的做法：如果你存的是 state_dict，這樣讀就好
     state = torch.load(ckpt_path, map_location=device)
@@ -147,6 +114,10 @@ def main():
     seed = int(diag_cfg.get("seed", 42))
     freeze_zero_tensors = bool(diag_cfg.get("freeze_all_zero_tensors", False))
 
+    # transformer models require the backprop Fisher (nngeometry lacks LayerNorm support)
+    default_method = "backprop" if get_model_type(config) == "Transformer" else "pmatdiag"
+    fim_method = str(diag_cfg.get("method", default_method)).lower()
+
     # reference size：預設用 train set 全量
     full_n = int(diag_cfg.get("full_n", len(train_loader.dataset)))
     full_n = min(full_n, len(train_loader.dataset))
@@ -154,14 +125,14 @@ def main():
     # 先算 reference
     ref_loader = make_subset_loader(train_loader, subset_size=full_n, seed=seed)
     ref_model = copy.deepcopy(model)
-    F_ref = compute_fim_diag_pmatdiag(ref_model, ref_loader, device=device, freeze_zero_tensors=freeze_zero_tensors)
+    F_ref = compute_fim_diag_pmatdiag(ref_model, ref_loader, device=device, freeze_zero_tensors=freeze_zero_tensors, method=fim_method)
 
     fisher_dict = {}
     for N in sample_sizes:
         N = int(N)
         sub_loader = make_subset_loader(train_loader, subset_size=N, seed=seed)
         sub_model = copy.deepcopy(model)
-        diag = compute_fim_diag_pmatdiag(sub_model, sub_loader, device=device, freeze_zero_tensors=freeze_zero_tensors)
+        diag = compute_fim_diag_pmatdiag(sub_model, sub_loader, device=device, freeze_zero_tensors=freeze_zero_tensors, method=fim_method)
         fisher_dict[N] = diag
 
     print(f"Device: {device}")
@@ -170,6 +141,7 @@ def main():
     print(f"Checkpoint: {ckpt_path}")
     print(f"Reference N(full_n): {full_n}")
     print(f"Freeze all-zero tensors: {freeze_zero_tensors}")
+    print(f"Fisher method: {fim_method}")
     print()
     print(f"{'N':>8} | {'MSE':>12} | {'MaxAbsErr':>12} | {'Spearman ρ':>10}")
     print("-" * 52)

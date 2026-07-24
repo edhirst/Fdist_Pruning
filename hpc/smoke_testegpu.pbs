@@ -1,0 +1,60 @@
+#!/bin/bash
+#PBS -q testegpu
+#PBS -N fdist_smoke
+#PBS -m abe
+#PBS -k oe
+#PBS -j oe
+# Fila de TESTE de GPU (testegpu): 30 min, ~0.5 MIG de uma A100, 8 nucleos.
+# Recursos alocados automaticamente, entao a linha -l fica comentada.
+# #PBS -l nodes=1:ppn=8
+
+# ---------------------------------------------------------------------------
+# SMOKE TEST — rode ISTO PRIMEIRO, antes de submeter os jobs reais.
+# Confirma, no proprio cluster e dentro do limite de 30 min: (1) o modulo +
+# ambiente virtual carregam, (2) o torch enxerga e usa a GPU (CUDA), (3) o
+# torch.func Fisher roda no ViT em GPU, (4) o pipeline completo (treino + todos
+# os esquemas de poda) roda e grava saidas. Usa 2 epocas + varredura grosseira.
+# Saidas ISOLADAS: models/smoke_*  e  results_smoke/  (nao afeta os jobs reais).
+# Submeta a partir da raiz do repo:   qsub hpc/smoke_testegpu.pbs
+# ---------------------------------------------------------------------------
+
+cd "$PBS_O_WORKDIR" || exit 1
+mkdir -p outputs
+# Se o repo estiver num subdir 'github', descomente:  # cd github || exit 1
+
+# Configura o ambiente para executar
+module load miniconda3/22.11.1-gcc-9.4.0
+source .venv/bin/activate
+
+# --- Sanidade do ambiente/GPU (aparece no topo do log) ---
+echo "===== SMOKE: sanidade do ambiente ====="
+echo "host: $(hostname)   data: $(date)"
+nvidia-smi -L 2>/dev/null || echo "AVISO: nvidia-smi indisponivel"
+python - <<'PY'
+import torch
+print("torch", torch.__version__, "| cuda disponivel:", torch.cuda.is_available(),
+      "| device:", (torch.cuda.get_device_name(0) if torch.cuda.is_available() else "CPU"))
+PY
+echo "======================================="
+
+# --- Pipeline completo, versao curta ---
+export BASE_CONFIG=configs/smoke_vit_cifar10.yaml
+chmod +x run_experiment.sh
+./run_experiment.sh
+STATUS=$?
+if [[ $STATUS -eq 0 ]]; then
+    echo "===== SMOKE OK: ambiente + GPU + pipeline funcionam. Pode submeter os jobs reais. ====="
+else
+    echo "===== SMOKE FALHOU (exit $STATUS): corrija o ambiente antes de submeter os jobs reais. ====="
+fi
+
+# Movendo a saída gerada no $HOME para o diretório final após o término do job
+JOBNUM="${PBS_JOBID%%.*}"
+LIVE_FILE="$HOME/${PBS_JOBNAME}.o${JOBNUM}"
+if [[ -f "$LIVE_FILE" ]]; then
+    mv "$LIVE_FILE" "$PBS_O_WORKDIR/outputs/"
+else
+    echo "AVISO: arquivo de saída do PBS não encontrado: $LIVE_FILE"
+fi
+
+exit $STATUS

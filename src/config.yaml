@@ -1,26 +1,45 @@
 paths:
-  pretrained_model_path: "models/SimpleNN_h2_n64.pth"
+  # null => auto: {model_save_path}/{arch_name}_{dataset}.pth
+  # (set an explicit path to reuse an existing checkpoint, e.g. "models/SimpleNN_h2_n64.pth")
+  pretrained_model_path: null
   dataset_path: "data/"
   model_save_path: "models/"
   log_path: "logs/"
+  # Root for pruning outputs. Each run is written under
+  # {results_dir}/{arch}_{dataset}/{scheme}_..._{timestamp}/ so that concurrent
+  # jobs for different architectures never overwrite each other's files.
+  # The env var FDIST_RESULTS_DIR overrides this (handy for per-job HPC output roots).
+  results_dir: "results"
 
 dataset:
-  # Options: "mnist", "fashion_mnist"
-  name: "mnist"
+  # Options: "mnist", "fashion_mnist", "cifar10" ("cifar" accepted as an alias).
+  # Both architectures run on any dataset; input shape is handled automatically
+  # (NN flattens: 784 inputs for mnist/fashion_mnist, 3072 for cifar10).
+  name: "cifar10"
 
 # ---------------------- Configuration for training model ----------------------
 model:
   common:
-    # Options: "NN", "CNN"
-    model_type: "NN"
+    # Options: "nn", "transformer" (legacy "NN", "CNN" also accepted)
+    model_type: "transformer"
     num_classes: 10
 
-  # Only used when model_type == "NN"
+  # Only used when model_type == "nn"
   NN:
     hidden_size: 64
     hidden_layers: 2
 
+  # Only used when model_type == "transformer" (SimpleViT; img size/channels come from dataset)
+  Transformer:
+    embed_dim: 128
+    depth: 4
+    num_heads: 4
+    mlp_ratio: 2.0
+    patch_size: 4
+    dropout: 0.0
+
 training:
+  # Flat keys are the base defaults (= the original NN/MNIST recipe, unchanged behavior)
   batch_size: 128
   num_epochs: 5
   learning_rate: 0.001
@@ -28,51 +47,90 @@ training:
   num_workers: 4      # parallel DataLoader workers; set 0 on Windows or if using fork-unsafe libs
   pin_memory: true    # faster CPU→GPU transfers; set false if running on CPU-only
 
+  # Optional per-architecture override blocks: training.transformer / training.nn / training.cnn
+  # replace the flat keys for that model_type only.
+  # SimpleNN on CIFAR-10 converges by ~50 epochs (test acc plateaus ~51%; a 2x64
+  # MLP is capacity-limited, train~=test so it is not overfitting). On MNIST it
+  # converges far sooner (~5 epochs, ~97%) but 50 epochs is harmless there too.
+  nn:
+    num_epochs: 50
+
+  # Overrides applied when model_type == "transformer" (standard small-ViT-from-scratch recipe)
+  transformer:
+    num_epochs: 50
+    learning_rate: 0.0005
+    optimizer: "adamw"
+    weight_decay: 0.05
+    warmup_epochs: 5
+    label_smoothing: 0.1
+    grad_clip: 1.0
+
 
 # ---------------------- Configuration for pruning model ----------------------
 pruning:
   enable_pruning: true # Always True when running pruning.py
-  pruning_scheme: "magnitude" # Options: magnitude, fim, f_dist_one_shot, f_dist_iterative, f_dist
+  pruning_scheme: "magnitude" # Options: magnitude, fim, f_dist_one_shot, f_dist_iterative, f_dist, f_dist_global
 
   # FIM-related settings (only used by FIM-based schemes)
   fim_subset_size: 500
   fim_subset_seed: 42
   fim_subset_shuffle: true
-  fim_calculate_method: "backprop" # Options: "nngeometry", "backprop"
-  # Sweep settings (pruning.py uses this to generate pruning ratios)
+  fim_calculate_method: "backprop" # Options: "nngeometry", "backprop" (transformer requires "backprop")
+  fim_device: "cpu"    # "cpu" | "auto". Measured on Apple Silicon: torch.func per-sample grads
+                       # run ~5x faster on CPU than MPS for these model sizes; use "auto" on CUDA.
+
+  # Which params are eligible for pruning. null => arch default:
+  #   nn: [] (everything prunable), transformer: [norm, pos_embed]
+  # Valid entries: norm, pos_embed, bias
+  prunable_exclude: null
+
+  # Sweep settings (run_pruning.py uses this to generate pruning ratios)
   sweep:
-    start: 0.8
+    start: 0.0
     end: 1.0
-    step: 0.02
+    step: 0.05
 
-  f_dist_avg_points: 2 # 
+  f_dist_avg_points: 3 # K path points: exact f_dist uses alpha in linspace(1,0,K); f_dist_global uses linspace(1,1/K,K)
 
-evaluation: 
-  # Basic metrics 
-  metrics: 
-    - accuracy 
-    - loss 
-    - precision 
+  # Magnitude warm-start for the f_dist family (f_dist, f_dist_iterative,
+  # f_dist_global, f_dist_one_shot). When enabled, ratios up to `ratio` are pruned
+  # by cheap magnitude pruning and the (expensive) f_dist scheme only runs for the
+  # high-sparsity tail (ratio -> end). The full 0->end curve is still produced.
+  # This is what makes exact f_dist tractable within HPC walltimes; the cheaper
+  # f_dist_global/iterative schemes complete full-range on an A100 in minutes, so
+  # set enabled: false when you want the whole curve produced by f_dist itself.
+  warm_start:
+    enabled: true
+    ratio: 0.8   # fraction of ALL params magnitude-pruned before f_dist takes over
+
+evaluation:
+  # Basic metrics
+  metrics:
+    - accuracy
+    - loss
+    - precision
     - f1-score
     - mcc
-  validation_split: 0.2 
-  
-# Cross-validation settings 
-cross_validation: 
+  validation_split: 0.2
+
+# Cross-validation settings
+cross_validation:
   num_folds: 1
 
-# Plotting settings 
-plots: 
-  save_plots: true 
+# Plotting settings
+plots:
+  save_plots: true
   plot_formats: ["png"] #...choose: ["png", "pdf"]
-  dpi: null 
+  dpi: null
 
-# NOTES: 
-# - To use Fashion-MNIST: change dataset.name to "fashion_mnist" 
-# - To use MNIST: change dataset.name to "mnist" 
-# - Pruning threshold typically ranges from 0.001 to 0.1 
-# - 0.001: very conservative (prunes very few weights) 
-# - 0.01: moderate (good starting point) 
-# - 0.1: aggressive (prunes many weights)
-
-# bash script
+# NOTES:
+# - Architecture is chosen via model.common.model_type: "nn" or "transformer";
+#   dataset via dataset.name — any combination works, default is cifar10 for both
+#   (consistent cross-architecture comparison; CIFAR-10 keeps headroom over the
+#   full 0-100% range, whereas MNIST curves stay flat until ~70% sparsity)
+# - To reproduce the original NN experiments: model_type: "nn", dataset.name: "mnist",
+#   and set paths.pretrained_model_path: "models/SimpleNN_h2_n64.pth"
+# - Exact f_dist needs ~#active-weights full-FIM evals per step: feasible only for
+#   the NN on mnist/fashion_mnist (~55k params). On cifar10 the NN has ~201k params
+#   (3072 inputs) and the ViT ~546k — use f_dist_global (path-averaged, K evals/step)
+#   there instead; the shell scripts apply this gating automatically

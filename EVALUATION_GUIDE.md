@@ -2,6 +2,48 @@
 
 This guide explains how to use the evaluation features in this project.
 
+## Architectures
+
+Both testbeds run through the same train → prune → evaluate pipeline and produce
+the same JSONs/plots (`metadata.model` and `metadata.dataset` distinguish runs):
+
+- `model_type: "nn"` — SimpleNN MLP (flattened input)
+- `model_type: "transformer"` — SimpleViT compact Vision Transformer
+
+Either architecture runs on any `dataset.name` from {`mnist`, `fashion_mnist`,
+`cifar10`} (`cifar` accepted as an alias). The default dataset is **cifar10 for
+both**, so the architectures are compared on the same task.
+
+The one-command entry point is `./try-script.sh [config.yaml]` (defaults to
+`src/config.yaml`): it trains the configured architecture+dataset if the checkpoint
+is missing, then runs all pruning schemes (magnitude, fim, f_dist_one_shot,
+f_dist_iterative, f_dist_global, plus exact f_dist only for the NN on
+mnist/fashion_mnist — at larger scales, e.g. the ~201k-param CIFAR NN or the
+~546k-param ViT, exact f_dist is computationally infeasible and `f_dist_global` is
+the path-averaged scheme to use).
+
+Outputs are grouped per run under
+`{paths.results_dir}/{arch}_{dataset}/{scheme}_..._{timestamp}/` (env var
+`FDIST_RESULTS_DIR` overrides the root), so runs for different architectures/datasets
+never overwrite one another — this is what lets two jobs run concurrently.
+
+### Magnitude warm-start (`pruning.warm_start`)
+
+For the f_dist family, `warm_start` prunes 0→`ratio` cheaply by magnitude and runs
+the (Fisher-based) f_dist scheme only for the `ratio`→1.0 tail, while still producing
+the full 0→100% curve. It is **on by default** (`ratio: 0.8`). This is what makes the
+exact per-coordinate `f_dist` tractable within HPC walltimes; set `enabled: false`
+for the full-range comparison where f_dist drives the entire curve. The active
+setting is recorded in `metadata.warm_start` of every results JSON.
+
+### Running on an HPC cluster
+
+`configs/nn_cifar10.yaml` and `configs/vit_cifar10.yaml` are ready-to-run experiment
+configs, and `hpc/` holds OpenPBS job scripts for the CENAPAD-SP Lovelace cluster
+(`hpc/nn_cifar10.pbs`, `hpc/vit_cifar10.pbs`) that submit the two architectures as
+independent, simultaneously-runnable jobs with no shared output files. See
+[hpc/README.md](hpc/README.md) for submission steps and the walltime analysis.
+
 ## Quick Start
 
 ### 1. Basic Training

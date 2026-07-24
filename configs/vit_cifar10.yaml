@@ -1,0 +1,80 @@
+# SimpleViT (compact Vision Transformer) on CIFAR-10 — full train + all pruning schemes.
+# Generated from src/config.yaml (model_type pinned to transformer, fim_device=auto for CUDA).
+# Run:  ./try-script.sh configs/vit_cifar10.yaml
+
+paths:
+  pretrained_model_path: null
+  dataset_path: data/
+  model_save_path: models/
+  log_path: logs/
+  results_dir: results
+dataset:
+  name: cifar10
+model:
+  common:
+    model_type: transformer
+    num_classes: 10
+  NN:
+    hidden_size: 64
+    hidden_layers: 2
+  Transformer:
+    embed_dim: 128
+    depth: 4
+    num_heads: 4
+    mlp_ratio: 2.0
+    patch_size: 4
+    dropout: 0.0
+training:
+  batch_size: 128
+  num_epochs: 5
+  learning_rate: 0.001
+  optimizer: adam
+  num_workers: 4
+  pin_memory: true
+  nn:
+    num_epochs: 50
+  transformer:
+    num_epochs: 50
+    learning_rate: 0.0005
+    optimizer: adamw
+    weight_decay: 0.05
+    warmup_epochs: 5
+    label_smoothing: 0.1
+    grad_clip: 1.0
+pruning:
+  enable_pruning: true
+  pruning_scheme: magnitude
+  fim_subset_size: 500
+  fim_subset_seed: 42
+  fim_subset_shuffle: true
+  fim_calculate_method: backprop
+  fim_device: auto
+  prunable_exclude: null
+  sweep:
+    start: 0.0
+    end: 1.0
+    step: 0.05
+  f_dist_avg_points: 3
+  # OFF for the research runs so the f_dist family (especially f_dist_global) is
+  # tested over the FULL 0->100% range instead of only the high-sparsity tail.
+  # Full-range f_dist_global is ~13 min on CPU (faster on the A100), so there is
+  # no walltime reason to warm-start it here. Set enabled: true to focus f_dist on
+  # the tail (e.g. to make exact f_dist tractable on MNIST).
+  warm_start:
+    enabled: false
+    ratio: 0.8
+evaluation:
+  metrics:
+  - accuracy
+  - loss
+  - precision
+  - f1-score
+  - mcc
+  validation_split: 0.2
+cross_validation:
+  num_folds: 1
+plots:
+  save_plots: true
+  plot_formats:
+  - png
+  dpi: null

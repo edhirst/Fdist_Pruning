@@ -13,6 +13,7 @@ except Exception:
             pass
 
 from ..utils.fim_calculator import calculate_fim_nngeometry, calculate_fim_backprop
+from .prunable import get_prunable_mask
 
 
 class FDistPruner(BasePruner):
@@ -41,6 +42,7 @@ class FDistPruner(BasePruner):
         self.f_dist_avg_points = int(self.parameters.get("f_dist_avg_points", 2))
         if self.f_dist_avg_points < 2:
             raise ValueError(f"f_dist average points must be >= 2, got {self.f_dist_avg_points}")
+        self.prunable_exclude = self.parameters.get("prunable_exclude", None)
 
         # cached total prunable params (trainable params) for delta->count conversion
         self._total_params = None
@@ -56,6 +58,16 @@ class FDistPruner(BasePruner):
         self.fim_calculate_method = str(
             self.parameters.get("fim_calculate_method", self.parameters.get("fim_backend", "nngeometry"))
         ).lower()
+
+        # preserve previously-set values when keys are absent (set_parameters used
+        # to silently reset these to defaults)
+        self.freeze_all_zero_tensors = bool(
+            self.parameters.get("freeze_all_zero_tensors", self.freeze_all_zero_tensors)
+        )
+        self.f_dist_avg_points = int(self.parameters.get("f_dist_avg_points", self.f_dist_avg_points))
+        if self.f_dist_avg_points < 2:
+            raise ValueError(f"f_dist average points must be >= 2, got {self.f_dist_avg_points}")
+        self.prunable_exclude = self.parameters.get("prunable_exclude", self.prunable_exclude)
 
     def _calculate_fim(self, model, train_loader, device="cpu"):
         """
@@ -161,7 +173,7 @@ class FDistPruner(BasePruner):
         
         before_nz, total_params_runtime = self._count_nonzero_and_total_prunable(model)
         if total_params_runtime == 0:
-            print("f_dist iterative: Pruned 0/0 parameters (0.00%), Remaining 0")
+            print("FDist (exact): Pruned 0/0 parameters (0.00%), Remaining 0")
             return model
         
         model.to(device)
@@ -175,13 +187,15 @@ class FDistPruner(BasePruner):
 
         if k_prune_target <= 0:
             print(
-                f"f_dist iterative: Pruned 0/{total_params_runtime} parameters (0.00%), "
+                f"FDist (exact): Pruned 0/{total_params_runtime} parameters (0.00%), "
                 f"Remaining {before_nz}"
             )
             return model
 
-        # recompute F_sqrt_avg on current model state
-        F_sqrt_avg_all = torch.sqrt(self.calculate_fim_avg(model, train_loader=train_loader, device=device))  
+        # recompute F_sqrt_avg on current model state (clamp guards against tiny
+        # negative Fisher values; no-op for the non-negative backprop Fisher)
+        F_avg_all = self.calculate_fim_avg(model, train_loader=train_loader, device=device)
+        F_sqrt_avg_all = torch.sqrt(torch.clamp(F_avg_all, min=0.0))
 
         # Flatten abs/weights over ALL params, build requires_grad mask
         all_abs, all_w = [], []
@@ -204,14 +218,15 @@ class FDistPruner(BasePruner):
                 "Ensure calculate_fim_avg aligns with model.parameters() flatten order."
             )
 
-        # prune only among active weights
-        active_mask = (w_flat != 0)
+        # prune only among active weights, restricted to prunable params
+        prunable_all = get_prunable_mask(model, exclude=self.prunable_exclude, requires_grad_only=False)
+        active_mask = (w_flat != 0) & prunable_all[grad_mask_all]
         active_count = int(active_mask.sum().item())
         k_prune = min(k_prune_target, active_count)
 
         if k_prune <= 0:
             print(
-                f"f_dist iterative: Pruned 0/{total_params_runtime} parameters (0.00%), "
+                f"FDist (exact): Pruned 0/{total_params_runtime} parameters (0.00%), "
                 f"Remaining {before_nz}"
             )
             return model
@@ -246,7 +261,7 @@ class FDistPruner(BasePruner):
         pruning_rate = 100.0 * pruned_params / max(total_params_runtime, 1)
 
         print(
-            f"f_dist iterative: "
+            f"FDist (exact): "
             f"Pruned {pruned_params}/{total_params_runtime} parameters ({pruning_rate:.2f}%), "
             f"Remaining {remaining}"
         )

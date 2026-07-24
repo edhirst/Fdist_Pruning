@@ -1,0 +1,47 @@
+#!/bin/bash
+#PBS -q umagpu
+#PBS -N fdist_nn_cifar10
+#PBS -m abe
+#PBS -k oe
+#PBS -j oe
+# Recursos necessarios para execução: nodes = Numero de nos computacionais, ppn = Numero de processos por no. Total de processos = nodes X ppn.
+# A fila umagpu (1 GPU A100) aloca os recursos automaticamente, entao a linha -l fica comentada.
+# #PBS -l nodes=1:ppn=16
+
+# ---------------------------------------------------------------------------
+# SimpleNN (2x64 MLP) on CIFAR-10: treina ate convergir (50 epocas) e roda todos
+# os esquemas de poda 0->100% (magnitude, fim, f_dist_one_shot, f_dist_iterative,
+# f_dist_global; o f_dist exato e' pulado automaticamente no CIFAR). warm_start
+# esta' OFF neste config, entao o f_dist_global e' testado em toda a faixa.
+# Saidas -> github/results/SimpleNN_h2_n64_cifar10/. Roda de forma independente do
+# vit_cifar10.pbs (checkpoint, diretorio de resultados e nome de job distintos).
+# ---------------------------------------------------------------------------
+
+# Entrar no diretório de onde o job foi enviado (a RAIZ do repositório).
+# Submeta a partir da raiz do repo:   qsub hpc/nn_cifar10.pbs
+cd "$PBS_O_WORKDIR" || exit 1
+mkdir -p outputs
+# Se você preferir submeter de um diretório PAI onde o repo é um subdir 'github',
+# descomente a linha abaixo (e submeta com: qsub github/hpc/nn_cifar10.pbs):
+# cd github || exit 1
+
+# Configura o ambiente para executar
+module load miniconda3/22.11.1-gcc-9.4.0
+# inicializar o conda para o shell e ativar o ambiente
+source .venv/bin/activate
+
+# Executar a tarefa: BASE_CONFIG seleciona o experimento (arquitetura + dataset)
+export BASE_CONFIG=configs/nn_cifar10.yaml
+chmod +x run_experiment.sh
+./run_experiment.sh
+#chmod +x try-script.sh
+#./try-script.sh "$BASE_CONFIG"
+
+# Movendo a saída gerada no $HOME para o diretório final após o término do job
+JOBNUM="${PBS_JOBID%%.*}"
+LIVE_FILE="$HOME/${PBS_JOBNAME}.o${JOBNUM}"
+if [[ -f "$LIVE_FILE" ]]; then
+    mv "$LIVE_FILE" "$PBS_O_WORKDIR/outputs/"
+else
+    echo "AVISO: arquivo de saída do PBS não encontrado: $LIVE_FILE"
+fi

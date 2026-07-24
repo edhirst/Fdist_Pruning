@@ -11,6 +11,7 @@ except Exception:
             pass
 
 from ..utils.fim_calculator import calculate_fim_nngeometry, calculate_fim_backprop
+from .prunable import get_prunable_mask
 
 
 class FDistIterativePruner(BasePruner):
@@ -18,7 +19,7 @@ class FDistIterativePruner(BasePruner):
     Iterative (cumulative) pruning with per-step recomputation of f_dist score.
 
     Score definition (default):
-        f_dist = FIM_diag * |w|
+        f_dist = sqrt(FIM_diag) * |w|
 
     IMPORTANT:
     - 'pruning_step' is interpreted as a DELTA pruning fraction per step
@@ -40,6 +41,7 @@ class FDistIterativePruner(BasePruner):
         self.step = float(self.parameters.get("pruning_step", 0.0))
         # Backend selection: "nngeometry" or "backprop"
         self.fim_calculate_method = str(self.parameters.get("fim_calculate_method", "nngeometry")).lower()
+        self.prunable_exclude = self.parameters.get("prunable_exclude", None)
         # cached total prunable params (trainable params) for delta->count conversion
         self._total_params = None
 
@@ -54,6 +56,7 @@ class FDistIterativePruner(BasePruner):
         self.fim_calculate_method = str(
             self.parameters.get("fim_calculate_method", self.parameters.get("fim_backend", "nngeometry"))
         ).lower()
+        self.prunable_exclude = self.parameters.get("prunable_exclude", self.prunable_exclude)
 
     def _calculate_fim(self, model, train_loader, device="cpu"):
         """
@@ -136,15 +139,20 @@ class FDistIterativePruner(BasePruner):
                 "Ensure your FIM calculator returns a vector aligned with model.parameters() flatten order."
             )
 
-        # active-only mask (exclude already-zero weights)
-        active_mask = (flat_w != 0)
+        # active-only mask (exclude already-zero weights and non-prunable params)
+        prunable_mask = get_prunable_mask(
+            model, exclude=self.prunable_exclude, requires_grad_only=True
+        ).to(flat_w.device)
+        active_mask = (flat_w != 0) & prunable_mask
         active_count = int(active_mask.sum().item())
 
         # we can prune at most active_count
         k_prune = min(k_prune_target, active_count)
 
-        # score definition: f_dist = fim * |w|
-        scores = torch.sqrt(fim_diag) * flat_w.abs()
+        # score definition: f_dist = sqrt(FIM_diag) * |w|
+        # (clamp guards against tiny negative Fisher values from any backend;
+        # the backprop Fisher is a sum of non-negative terms so this is a no-op there)
+        scores = torch.sqrt(torch.clamp(fim_diag, min=0.0)) * flat_w.abs()
         active_scores = scores[active_mask]
 
         # select k smallest active scores to prune

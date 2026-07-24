@@ -5,17 +5,18 @@ import numpy as np
 import copy
 import torch
 import torch.nn as nn
+import matplotlib
+matplotlib.use("Agg")  # headless-safe (HPC compute nodes have no display)
 import matplotlib.pyplot as plt
 import json
 from datetime import datetime
 from torch.utils.data import DataLoader, Subset
 
-from .utils.data_loader import load_mnist, load_fashion_mnist
-from .models.simple_cnn import SimpleCNN
-from .models.simple_nn import SimpleNN
+from .utils.data_loader import build_dataloaders
+from .utils.model_builder import build_model_from_config, get_model_type, resolve_checkpoint_path
 from .utils.evaluation import (
     evaluate_accuracy, evaluate_precision, evaluate_f1, evaluate_mcc,
-    get_model_size_kb, count_nonzero_params
+    get_model_size_kb, count_nonzero_params, calculate_auc
 )
 
 # Pruners
@@ -24,6 +25,11 @@ from .pruning.fim_pruning import FIMPruner
 from .pruning.f_dist_one_shot import FDistOneShotPruner
 from .pruning.f_dist_iterative import FDistIterativePruner
 from .pruning.f_dist import FDistPruner
+from .pruning.f_dist_global import FDistGlobalPruner
+from .pruning.prunable import resolve_prunable_exclude
+
+# Schemes whose scoring needs Fisher information (and hence a train_loader)
+FIM_SCHEMES = {"fim", "f_dist_one_shot", "f_dist_iterative", "f_dist", "f_dist_global"}
 
 
 # load config from yaml
@@ -42,46 +48,6 @@ def get_device():
     if getattr(torch.backends, "mps", None) is not None and torch.backends.mps.is_available():
         return torch.device("mps")
     return torch.device("cpu")
-
-
-
-def build_dataloaders(config):
-    dataset_name = config.get("dataset", {}).get("name", "mnist").lower()
-    batch_size = config["training"]["batch_size"]
-    num_workers = int(config.get("training", {}).get("num_workers", 4))
-    pin_memory = bool(config.get("training", {}).get("pin_memory", True))
-
-    if dataset_name == "mnist":
-        train_loader = load_mnist(batch_size=batch_size, train=True, download=True, num_workers=num_workers, pin_memory=pin_memory)
-        test_loader = load_mnist(batch_size=batch_size, train=False, download=True, num_workers=num_workers, pin_memory=pin_memory)
-    elif dataset_name == "fashion_mnist":
-        train_loader = load_fashion_mnist(batch_size=batch_size, train=True, download=True, num_workers=num_workers, pin_memory=pin_memory)
-        test_loader = load_fashion_mnist(batch_size=batch_size, train=False, download=True, num_workers=num_workers, pin_memory=pin_memory)
-    else:
-        raise ValueError(f"Unknown dataset: {dataset_name}")
-
-    return dataset_name, train_loader, test_loader
-
-
-def build_model_from_config(config):
-    model_cfg = config.get("model", {})
-    common_cfg = model_cfg.get("common", {})
-    model_type = common_cfg.get("model_type", "NN")
-    num_classes = common_cfg.get("num_classes", 10)
-
-    if model_type == "NN":
-        nn_cfg = model_cfg.get("NN", {})
-        hidden_size = nn_cfg.get("hidden_size", 32)
-        hidden_layers = nn_cfg.get("hidden_layers", 2)
-        model = SimpleNN(hidden_size = hidden_size, hidden_layers = hidden_layers, num_classes = num_classes)
-        arch_name = f"SimpleNN_h{hidden_layers}_w{hidden_size}"
-    elif model_type == "CNN":
-        model = SimpleCNN(num_classes=num_classes)
-        arch_name = f"SimpleCNN"
-    else:
-        raise ValueError(f"Unknown model_type: {model_type}")
-
-    return model, arch_name
 
 
 
@@ -143,20 +109,25 @@ def build_pruner(config, scheme: str):
         pruner.apply_pruning(model, train_loader=..., device=...)
     """
     p_cfg = config.get("pruning", {})
+    prunable_exclude = resolve_prunable_exclude(p_cfg, get_model_type(config))
 
     if scheme == "magnitude":
-        return MagnitudePruner(threshold=0.0)
+        pruner = MagnitudePruner(threshold=0.0)
+        pruner.set_parameters({"pruning_threshold": 0.0, "prunable_exclude": prunable_exclude})
+        return pruner
 
     if scheme == "fim":
         return FIMPruner(parameters={
             "pruning_threshold": 0.0,
             "fim_calculate_method": p_cfg.get("fim_calculate_method", "nngeometry"),
+            "prunable_exclude": prunable_exclude,
         })
 
     if scheme == "f_dist_one_shot":
         return FDistOneShotPruner(parameters={
             "pruning_threshold": 0.0,
             "fim_calculate_method": p_cfg.get("fim_calculate_method", "nngeometry"),
+            "prunable_exclude": prunable_exclude,
         })
 
     if scheme == "f_dist_iterative":
@@ -164,16 +135,45 @@ def build_pruner(config, scheme: str):
         return FDistIterativePruner(parameters={
             "pruning_step": 0.0,
             "fim_calculate_method": p_cfg.get("fim_calculate_method", "nngeometry"),
+            "prunable_exclude": prunable_exclude,
         })
 
     if scheme == "f_dist":
         return FDistPruner(parameters={
             "fim_calculate_method": p_cfg.get("fim_calculate_method", "nngeometry"),
             "freeze_all_zero_tensors": True,
-            "f_dist_avg_points": p_cfg.get("f_dist_avg_points", 2)
+            "f_dist_avg_points": p_cfg.get("f_dist_avg_points", 2),
+            "prunable_exclude": prunable_exclude,
+        })
+
+    if scheme == "f_dist_global":
+        return FDistGlobalPruner(parameters={
+            "pruning_step": 0.0,
+            "fim_calculate_method": p_cfg.get("fim_calculate_method", "backprop"),
+            "f_dist_avg_points": p_cfg.get("f_dist_avg_points", 3),
+            "prunable_exclude": prunable_exclude,
         })
 
     raise ValueError(f"Unknown pruning_scheme: {scheme}")
+
+
+def _magnitude_pruned_copy(baseline_model, target_ratio, start, prunable_exclude, device):
+    """
+    Return a fresh copy of baseline_model magnitude-pruned to ABSOLUTE sparsity
+    target_ratio (fraction of all params). baseline_model may already be pruned to
+    `start`, so we only prune the additional (target_ratio - start).
+
+    Used by the magnitude warm-start: cheap magnitude pruning covers the low-sparsity
+    part of the curve so the expensive f_dist scheme only runs for the tail.
+    """
+    m = copy.deepcopy(baseline_model).to(device)
+    delta = max(0.0, float(target_ratio) - float(start))
+    if delta > 0.0:
+        wp = MagnitudePruner(threshold=0.0)
+        wp.set_parameters({"pruning_threshold": delta, "prunable_exclude": prunable_exclude})
+        m = wp.apply_pruning(m, train_loader=None, device=device)
+    m.eval()
+    return m
 
 
 def plot_metric(ratios, values, ylabel, save_path=None, dpi=300):
@@ -203,15 +203,35 @@ def main():
     scheme = str(p_cfg.get("pruning_scheme", "magnitude")).lower()
 
     device = get_device()
-    dataset_name, train_loader, test_loader = build_dataloaders(config)
+    model_type = get_model_type(config)
+    prunable_exclude = resolve_prunable_exclude(p_cfg, model_type)
+
+    # Fail fast: KFAC (nngeometry) cannot represent transformer layers
+    fim_method = str(p_cfg.get("fim_calculate_method", "nngeometry")).lower()
+    if scheme in FIM_SCHEMES and model_type == "Transformer" and fim_method in ("nngeometry", "nngeo"):
+        raise ValueError(
+            "fim_calculate_method='nngeometry' is not supported for transformer models "
+            "(PMatKFAC lacks LayerNorm/attention support). "
+            "Set pruning.fim_calculate_method: 'backprop'."
+        )
+
+    # Optional escape hatch: run FIM-based sweeps on CPU (torch.func per-sample
+    # gradients can be slower or unsupported on some accelerators)
+    if scheme in FIM_SCHEMES and str(p_cfg.get("fim_device", "auto")).lower() == "cpu":
+        device = torch.device("cpu")
+        print("pruning.fim_device=cpu -> running this sweep on CPU")
+
+    dataset_name, train_loader, test_loader = build_dataloaders(config, augment=False)
 
     # Build model architecture and load checkpoint
-    model, arch_name = build_model_from_config(config)
+    model, arch_name = build_model_from_config(config, dataset_name=dataset_name)
     model = model.to(device)
 
-    ckpt_path = (config.get("paths", {}) or {}).get("pretrained_model_path", None)
-    if not ckpt_path:
-        raise ValueError("Missing config: paths.pretrained_model_path")
+    ckpt_path = resolve_checkpoint_path(config, arch_name, dataset_name)
+    if not os.path.isfile(ckpt_path):
+        raise FileNotFoundError(
+            f"Checkpoint not found: {ckpt_path}. Train it first: python -m src.train_model"
+        )
 
     state = torch.load(ckpt_path, map_location=device)
     model.load_state_dict(state)
@@ -229,7 +249,7 @@ def main():
     baseline_model = copy.deepcopy(model).to(device)
     if start > 0.0:
         warm_pruner = MagnitudePruner(threshold=0.0)
-        warm_pruner.set_parameters({"pruning_threshold": start})
+        warm_pruner.set_parameters({"pruning_threshold": start, "prunable_exclude": prunable_exclude})
         baseline_model = warm_pruner.apply_pruning(baseline_model, train_loader=None, device=device)
         baseline_model.eval()
 
@@ -247,7 +267,17 @@ def main():
     
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     fold_suffix = f"_fold{current_fold}" if current_fold is not None else ""
-    results_dir = os.path.join("results", f"{scheme}_pruning_result_figure_{timestamp}{fold_suffix}")
+
+    # Output root: env override (handy for HPC) > paths.results_dir > "results".
+    # Group every run under a per-(architecture, dataset) subdirectory so that
+    # concurrent jobs for different models never collide on output files — the
+    # scheme + timestamp alone are NOT unique across architectures.
+    paths_cfg = config.get("paths", {}) or {}
+    results_root = os.environ.get("FDIST_RESULTS_DIR") or paths_cfg.get("results_dir") or "results"
+    run_group = f"{arch_name}_{dataset_name}"
+    results_dir = os.path.join(
+        results_root, run_group, f"{scheme}_pruning_result_figure_{timestamp}{fold_suffix}"
+    )
     os.makedirs(results_dir, exist_ok=True)
     if save_plots:
         print(f"Saving result figures to: {results_dir}")
@@ -280,12 +310,7 @@ def main():
 
 
     # For FIM-based schemes, optionally use subset loader
-    use_fim_loader = scheme in {
-        "fim",
-        "f_dist_one_shot",
-        "f_dist_iterative",
-        "f_dist",
-    }
+    use_fim_loader = scheme in FIM_SCHEMES
     if use_fim_loader:
         fim_subset_size = int(p_cfg.get("fim_subset_size", 0))
         fim_seed = int(p_cfg.get("fim_subset_seed", 42))
@@ -297,6 +322,19 @@ def main():
     else:
         fim_loader = None
 
+    # Magnitude warm-start config: for the f_dist family, prune 0->warm_ratio by
+    # magnitude and only run the expensive f_dist scheme for the warm_ratio->end
+    # tail (the full curve is still produced). Does not touch magnitude/fim.
+    FDIST_FAMILY = ("f_dist", "f_dist_iterative", "f_dist_global", "f_dist_one_shot")
+    warm_cfg = p_cfg.get("warm_start", {}) or {}
+    warm_enabled = bool(warm_cfg.get("enabled", True))
+    warm_ratio = min(1.0, max(0.0, float(warm_cfg.get("ratio", 0.8))))
+    use_warm = warm_enabled and scheme in FDIST_FAMILY and warm_ratio > start + 1e-12
+    if use_warm:
+        print(f"warm-start: magnitude 0->{warm_ratio:.2f}, then {scheme} for the {warm_ratio:.2f}->{end:.2f} tail")
+        if warm_ratio >= end - 1e-12:
+            print(f"  (note: warm_start.ratio {warm_ratio} >= sweep end {end}; the whole curve is magnitude)")
+
     # Storage for curves and output JSON file
     results_json = {
         "metadata": {
@@ -304,6 +342,7 @@ def main():
             "dataset": dataset_name,
             "model": arch_name,
             "timestamp": timestamp,
+            "warm_start": {"enabled": bool(use_warm), "ratio": warm_ratio} if scheme in FDIST_FAMILY else {"enabled": False},
         },
         "results": {
             "pruning_ratio": [],
@@ -314,86 +353,84 @@ def main():
         }
     }
 
+    def _eval_and_record(m, r):
+        """Evaluate model m at sparsity r and append normalized metrics + print."""
+        acc = evaluate_accuracy(m, test_loader, device=device)
+        prec = evaluate_precision(m, test_loader, device=device)
+        f1 = evaluate_f1(m, test_loader, device=device)
+        mcc = evaluate_mcc(m, test_loader, device=device)
+        results_json["results"]["pruning_ratio"].append(r)
+        results_json["results"]["acc_norm"].append(acc / base_acc)
+        results_json["results"]["precision_norm"].append(prec / base_prec)
+        results_json["results"]["f1_norm"].append(f1 / base_f1)
+        results_json["results"]["mcc_norm"].append(mcc / base_mcc)
+        print(f"pruning ratio: {r*100:>5.1f}%, accuracy: {acc*100:.2f}% | precision: {prec:.4f} | f1: {f1:.4f} | mcc: {mcc:.4f}")
+
 
     # One-shot sweep: to guarantee exact prune ratio semantics (prune ratio of original),
     # we evaluate each ratio from a fresh copy of the baseline model.
     # This avoids ambiguity when zeros accumulate across steps.
-    if scheme == "f_dist_iterative":
-        pruned_model = copy.deepcopy(baseline_model).to(device)
-
+    if scheme in ("f_dist_iterative", "f_dist_global"):
         pruner = build_pruner(config, scheme)
 
         pruner.set_parameters({
             "fim_calculate_method": str(p_cfg.get("fim_calculate_method", "nngeometry")).lower(),
             "pruning_step": step,
+            "f_dist_avg_points": p_cfg.get("f_dist_avg_points", 3),
+            "prunable_exclude": prunable_exclude,
         })
+
+        pruned_model = None        # f_dist working model, initialised lazily
+        last_warm_ratio = start    # magnitude sparsity where f_dist takes over
 
         for r in ratios:
             if abs(r - start) < 1e-12:
-                acc = evaluate_accuracy(pruned_model, test_loader, device=device)
-                prec = evaluate_precision(pruned_model, test_loader, device=device)
-                f1 = evaluate_f1(pruned_model, test_loader, device=device)
-                mcc = evaluate_mcc(pruned_model, test_loader, device=device)
+                m = baseline_model
+            elif use_warm and r <= warm_ratio + 1e-12:
+                # warm phase: cheap magnitude point
+                m = _magnitude_pruned_copy(baseline_model, r, start, prunable_exclude, device)
+                last_warm_ratio = r
             else:
-                pruned_model = pruner.apply_pruning(
-                    pruned_model,
-                    train_loader=fim_loader,
-                    device=device,
-                )
+                # f_dist tail: continue delta-stepping from the warm (or baseline) state
+                if pruned_model is None:
+                    pruned_model = (
+                        _magnitude_pruned_copy(baseline_model, last_warm_ratio, start, prunable_exclude, device)
+                        if use_warm else copy.deepcopy(baseline_model).to(device)
+                    )
+                pruned_model = pruner.apply_pruning(pruned_model, train_loader=fim_loader, device=device)
+                m = pruned_model
 
-                # Evaluate
-                acc = evaluate_accuracy(pruned_model, test_loader, device=device)
-                prec = evaluate_precision(pruned_model, test_loader, device=device)
-                f1 = evaluate_f1(pruned_model, test_loader, device=device)
-                mcc = evaluate_mcc(pruned_model, test_loader, device=device)
-
-            results_json["results"]["pruning_ratio"].append(r)
-            results_json["results"]["acc_norm"].append(acc / base_acc)
-            results_json["results"]["precision_norm"].append(prec / base_prec)
-            results_json["results"]["f1_norm"].append(f1 / base_f1)
-            results_json["results"]["mcc_norm"].append(mcc / base_mcc)
-
-            # Print in the format you asked for (and keep extra metrics for debugging)
-            print(f"pruning ratio: {r*100:>5.1f}%, accuracy: {acc*100:.2f}% | precision: {prec:.4f} | f1: {f1:.4f} | mcc: {mcc:.4f}")   
+            _eval_and_record(m, r)
 
     elif scheme == "f_dist":
-        pruned_model = copy.deepcopy(baseline_model).to(device)
-
         pruner = build_pruner(config, scheme)
 
         pruner.set_parameters({
             "fim_calculate_method": str(p_cfg.get("fim_calculate_method", "nngeometry")).lower(),
             "pruning_step": step,
+            "prunable_exclude": prunable_exclude,
         })
+
+        pruned_model = None        # f_dist working model, initialised lazily
+        last_warm_ratio = start    # magnitude sparsity where f_dist takes over
 
         for r in ratios:
             if abs(r - start) < 1e-12:
-                acc = evaluate_accuracy(pruned_model, test_loader, device=device)
-                prec = evaluate_precision(pruned_model, test_loader, device=device)
-                f1 = evaluate_f1(pruned_model, test_loader, device=device)
-                mcc = evaluate_mcc(pruned_model, test_loader, device=device)
+                m = baseline_model
+            elif use_warm and r <= warm_ratio + 1e-12:
+                m = _magnitude_pruned_copy(baseline_model, r, start, prunable_exclude, device)
+                last_warm_ratio = r
             else:
-                pruned_model = pruner.apply_pruning(
-                    pruned_model,
-                    train_loader = fim_loader,
-                    device = device
-                )
+                if pruned_model is None:
+                    pruned_model = (
+                        _magnitude_pruned_copy(baseline_model, last_warm_ratio, start, prunable_exclude, device)
+                        if use_warm else copy.deepcopy(baseline_model).to(device)
+                    )
+                pruned_model = pruner.apply_pruning(pruned_model, train_loader=fim_loader, device=device)
+                m = pruned_model
 
-                acc = evaluate_accuracy(pruned_model, test_loader, device=device)
-                prec = evaluate_precision(pruned_model, test_loader, device=device)
-                f1 = evaluate_f1(pruned_model, test_loader, device=device)
-                mcc = evaluate_mcc(pruned_model, test_loader, device=device)
+            _eval_and_record(m, r)
 
-            results_json["results"]["pruning_ratio"].append(r)
-            results_json["results"]["acc_norm"].append(acc / base_acc)
-            results_json["results"]["precision_norm"].append(prec / base_prec)
-            results_json["results"]["f1_norm"].append(f1 / base_f1)
-            results_json["results"]["mcc_norm"].append(mcc / base_mcc)
-
-            print(f"pruning ratio: {r*100:>5.1f}%, accuracy: {acc*100:.2f}% | precision: {prec:.4f} | f1: {f1:.4f} | mcc: {mcc:.4f}")
-
-
-            
     else:
         # code for "magnitude", "fim", "f_dist_one_shot"
         for r in ratios:
@@ -405,23 +442,42 @@ def main():
 
             # Unified dict-style parameter setting
             if scheme == "magnitude":
-                pruner.set_parameters({"pruning_threshold": delta})
+                pruner.set_parameters({"pruning_threshold": delta, "prunable_exclude": prunable_exclude})
                 pruned_model = pruner.apply_pruning(pruned_model, train_loader=None, device=device)
 
             elif scheme == "fim":
                 pruner.set_parameters({
                     "pruning_threshold": delta,
                     "fim_calculate_method": str(p_cfg.get("fim_calculate_method", "nngeometry")).lower(),
+                    "prunable_exclude": prunable_exclude,
                 })
                 pruned_model = pruner.apply_pruning(pruned_model, train_loader=fim_loader, device=device)
 
             elif scheme == "f_dist_one_shot":
-                # assumes its apply_pruning uses its internal thresholds
-                pruner.set_parameters({
-                    "pruning_threshold": delta,
-                    "fim_calculate_method": str(p_cfg.get("fim_calculate_method", "nngeometry")).lower(),
-                })
-                pruned_model = pruner.apply_pruning(pruned_model, train_loader=fim_loader, device=device)
+                if use_warm and r <= warm_ratio + 1e-12:
+                    # warm phase: cheap magnitude point (no Fisher eval)
+                    wp = MagnitudePruner(threshold=0.0)
+                    wp.set_parameters({"pruning_threshold": delta, "prunable_exclude": prunable_exclude})
+                    pruned_model = wp.apply_pruning(pruned_model, train_loader=None, device=device)
+                else:
+                    if use_warm:
+                        # magnitude to warm_ratio, then one-shot f_dist for the remainder
+                        wp = MagnitudePruner(threshold=0.0)
+                        wp.set_parameters({
+                            "pruning_threshold": max(0.0, warm_ratio - start),
+                            "prunable_exclude": prunable_exclude,
+                        })
+                        pruned_model = wp.apply_pruning(pruned_model, train_loader=None, device=device)
+                        os_delta = max(0.0, float(r - warm_ratio))
+                    else:
+                        os_delta = delta
+                    # assumes its apply_pruning uses its internal thresholds
+                    pruner.set_parameters({
+                        "pruning_threshold": os_delta,
+                        "fim_calculate_method": str(p_cfg.get("fim_calculate_method", "nngeometry")).lower(),
+                        "prunable_exclude": prunable_exclude,
+                    })
+                    pruned_model = pruner.apply_pruning(pruned_model, train_loader=fim_loader, device=device)
 
             else:
                 raise ValueError(f"Unknown scheme: {scheme}")
@@ -461,6 +517,14 @@ def main():
                            ylabel=ylabel, save_path=save_path, dpi=plot_dpi)
 
 
+    # AUC of each normalized-metric curve over the swept range (higher = accuracy
+    # retained longer under pruning)
+    results_json["auc"] = {
+        key: calculate_auc(ratios, results_json["results"][key])
+        for key in ("acc_norm", "precision_norm", "f1_norm", "mcc_norm")
+    }
+    print("AUC:", {k: round(v, 4) for k, v in results_json["auc"].items()})
+
     json_path = os.path.join(results_dir, f"{scheme}_results.json")
     with open(json_path, "w") as f:
         json.dump(results_json, f, indent=2)
@@ -473,9 +537,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
-
-
-
-###### To be continue...
-# Add AUC scores for all four pruning methods and save in JSON file.

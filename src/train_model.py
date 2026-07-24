@@ -1,19 +1,19 @@
 import os
 import sys
+import math
 import yaml
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from .utils.data_loader import load_mnist, load_fashion_mnist
-from .models.simple_cnn import SimpleCNN
-from .models.simple_nn import SimpleNN 
+from .utils.data_loader import build_dataloaders
+from .utils.model_builder import build_model_from_config, get_model_type, resolve_checkpoint_path
 
 
 # load config from yaml
 def load_config(config_path: str):
     with open(config_path, "r") as file:
         config = yaml.safe_load(file)
-    
+
     return config
 
 # Use GPU if available else CPU
@@ -29,15 +29,17 @@ def get_device():
 
 # ------------------------------- Training Script -------------------------------
 
-def train_epoch(model, train_loader, criterion, optimizer, device):
+def train_epoch(model, train_loader, criterion, optimizer, device, scheduler=None, grad_clip=None):
     """
-        Train model for one epoch
+        Train model for one epoch.
+        scheduler (if given) is stepped per batch; grad_clip (if given) applies
+        gradient-norm clipping — both are used by the transformer recipe only.
     """
     model.train()
     running_loss = 0.0
     correct = 0
     total = 0
-    
+
     for inputs, labels in train_loader:
         inputs = inputs.to(device)
         labels = labels.to(device)
@@ -48,13 +50,17 @@ def train_epoch(model, train_loader, criterion, optimizer, device):
 
         optimizer.zero_grad()
         loss.backward()
+        if grad_clip is not None and grad_clip > 0:
+            torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
         optimizer.step()
-        
+        if scheduler is not None:
+            scheduler.step()
+
         running_loss += loss.item()
         _, predicted = outputs.max(1)
         total += labels.size(0)
         correct += predicted.eq(labels).sum().item()
-    
+
     avg_loss = running_loss / len(train_loader)
     accuracy = 100. * correct / total
 
@@ -86,62 +92,30 @@ def evaluate(model, data_loader, criterion, device):
     return avg_loss, accuracy
 
 
-
-def build_dataloaders(config):
+def get_training_cfg(config, model_type):
     """
-        Load dataset based on config
+    Flat training keys are the base defaults; an optional per-architecture block
+    (training.transformer / training.nn / training.cnn) overrides them for that
+    model type.
     """
-    dataset_name = config.get("dataset", {}).get("name", "mnist").lower()
-    batch_size = config["training"]["batch_size"]
-    num_workers = int(config.get("training", {}).get("num_workers", 4))
-    pin_memory = bool(config.get("training", {}).get("pin_memory", True))
-
-    if dataset_name == "mnist":
-        train_loader = load_mnist(batch_size=batch_size, train=True, download=True, num_workers=num_workers, pin_memory=pin_memory)
-        test_loader = load_mnist(batch_size=batch_size, train=False, download=True, num_workers=num_workers, pin_memory=pin_memory)
-    elif dataset_name == "fashion_mnist":
-        train_loader = load_fashion_mnist(batch_size=batch_size, train=True, download=True, num_workers=num_workers, pin_memory=pin_memory)
-        test_loader = load_fashion_mnist(batch_size=batch_size, train=False, download=True, num_workers=num_workers, pin_memory=pin_memory)
-    else:
-        raise ValueError(f"Unknown dataset: {dataset_name}")
-
-    return dataset_name, train_loader, test_loader
+    override_key = {"Transformer": "transformer", "NN": "nn", "CNN": "cnn"}[model_type]
+    tr_cfg = dict(config.get("training", {}) or {})
+    overrides = tr_cfg.get(override_key, {}) or {}
+    for key in ("transformer", "nn", "cnn"):
+        tr_cfg.pop(key, None)
+    tr_cfg.update(overrides)
+    return tr_cfg
 
 
-
-def build_model(config):
-    model_cfg = config.get("model", {})
-    common_cfg = model_cfg.get("common", {})
-
-    model_type = common_cfg.get("model_type", "NN")
-    num_classes = common_cfg.get("num_classes", 10)
-
-    if model_type == "NN":
-        nn_cfg = model_cfg.get("NN", {})
-        hidden_size = nn_cfg.get("hidden_size", 32)
-        hidden_layers = nn_cfg.get("hidden_layers", 2)
-        model = SimpleNN(hidden_size=hidden_size, hidden_layers=hidden_layers, num_classes=num_classes)
-        arch_name = f"SimpleNN_h{hidden_layers}_n{hidden_size}"
-
-    elif model_type == "CNN":
-        cnn_cfg = model_cfg.get("CNN", {}) or {}
-        # If your SimpleCNN accepts extra args, read from cnn_cfg here.
-        # For now, only num_classes:
-        model = SimpleCNN(num_classes=num_classes)
-        arch_name = f"SimpleCNN"
-
-    else:
-        raise ValueError(f"Unknown model_type: {model_type}. Supported: 'NN', 'CNN'.")
-
-    return model, arch_name
-
-
-def build_optimizer(config, model):
-    learning_rate = config["training"]["learning_rate"]
-    optimizer_name = config["training"].get("optimizer", "adam").lower()
+def build_optimizer(tr_cfg, model):
+    learning_rate = tr_cfg["learning_rate"]
+    optimizer_name = str(tr_cfg.get("optimizer", "adam")).lower()
 
     if optimizer_name == "adam":
         optimizer = optim.Adam(model.parameters(), lr=learning_rate)
+    elif optimizer_name == "adamw":
+        weight_decay = float(tr_cfg.get("weight_decay", 0.05))
+        optimizer = optim.AdamW(model.parameters(), lr=learning_rate, weight_decay=weight_decay)
     elif optimizer_name == "sgd":
         optimizer = optim.SGD(model.parameters(), lr=learning_rate, momentum=0.9)
     else:
@@ -151,42 +125,70 @@ def build_optimizer(config, model):
     return optimizer
 
 
-def make_model_filename(config, arch_name: str):
-    tr_cfg = config.get("training", {})
-    # Example:
-    # SimpleNN_h2_n32.pth
-    return f"{arch_name}.pth"
+def build_warmup_cosine_scheduler(optimizer, warmup_epochs, num_epochs, steps_per_epoch):
+    """Linear warmup then cosine decay, stepped per batch (standard ViT recipe)."""
+    warmup_steps = int(warmup_epochs * steps_per_epoch)
+    total_steps = max(1, int(num_epochs * steps_per_epoch))
 
+    def lr_lambda(step):
+        if step < warmup_steps:
+            return float(step + 1) / float(max(1, warmup_steps))
+        progress = float(step - warmup_steps) / float(max(1, total_steps - warmup_steps))
+        return 0.5 * (1.0 + math.cos(math.pi * min(1.0, progress)))
 
+    return optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
 
 
 def train_model(config, device):
     """
         Main training function that takes config as input
     """
+    model_type = get_model_type(config)
 
-    dataset_name, train_loader, test_loader = build_dataloaders(config)
-    model, arch_name = build_model(config)
+    # augmentation is train-split-only and currently applies to CIFAR-10
+    dataset_name, train_loader, test_loader = build_dataloaders(config, augment=True)
+    model, arch_name = build_model_from_config(config, dataset_name=dataset_name)
     model = model.to(device)
 
-    criterion = nn.CrossEntropyLoss()
-    optimizer = build_optimizer(config, model)
+    tr_cfg = get_training_cfg(config, model_type)
 
-    num_epochs = config["training"]["num_epochs"]
-    batch_size = config["training"]["batch_size"]
-    learning_rate = config["training"]["learning_rate"]
+    label_smoothing = float(tr_cfg.get("label_smoothing", 0.0))
+    criterion = nn.CrossEntropyLoss(label_smoothing=label_smoothing)
+    optimizer = build_optimizer(tr_cfg, model)
+
+    num_epochs = int(tr_cfg["num_epochs"])
+    batch_size = tr_cfg["batch_size"]
+    learning_rate = tr_cfg["learning_rate"]
+    grad_clip = tr_cfg.get("grad_clip", None)
+    grad_clip = float(grad_clip) if grad_clip else None
+
+    scheduler = None
+    warmup_epochs = tr_cfg.get("warmup_epochs", None)
+    if warmup_epochs is not None:
+        scheduler = build_warmup_cosine_scheduler(
+            optimizer, float(warmup_epochs), num_epochs, len(train_loader)
+        )
 
     # Train the model
 
+    n_params = sum(p.numel() for p in model.parameters())
     print(f"\nStarting training for {num_epochs} epochs...")
     print(f"Device: {device}")
     print(f"Dataset: {dataset_name}")
+    print(f"Model: {arch_name} ({n_params:,} params)")
     print(f"Batch size: {batch_size}")
     print(f"Learning rate: {learning_rate}")
+    print(f"Optimizer: {tr_cfg.get('optimizer', 'adam')}"
+          + (f" | warmup {warmup_epochs} ep + cosine" if scheduler is not None else "")
+          + (f" | label_smoothing {label_smoothing}" if label_smoothing else "")
+          + (f" | grad_clip {grad_clip}" if grad_clip else ""))
     print("-" * 50)
-    
+
     for epoch in range(num_epochs):
-        train_loss, train_acc = train_epoch(model, train_loader, criterion, optimizer, device)
+        train_loss, train_acc = train_epoch(
+            model, train_loader, criterion, optimizer, device,
+            scheduler=scheduler, grad_clip=grad_clip,
+        )
         print(f"Epoch [{epoch+1}/{num_epochs}] - Loss: {train_loss:.4f}, Accuracy: {train_acc:.2f}%")
 
     print("-" * 50)
@@ -196,16 +198,13 @@ def train_model(config, device):
     test_loss, test_acc = evaluate(model, test_loader, criterion, device)
     print(f"Test Loss: {test_loss:.4f}, Test Accuracy: {test_acc:.2f}%")
 
-    
-    # Save model if path specified
-    model_save_path = config.get('paths', {}).get('model_save_path')
-    if model_save_path:
-        os.makedirs(model_save_path, exist_ok=True)
-        filename = make_model_filename(config, arch_name)
-        save_file = os.path.join(model_save_path, filename)
-        torch.save(model.state_dict(), save_file)
-        print(f"Model saved to: {save_file}")
-    
+
+    # Save model where run_pruning.py will look for it
+    save_file = resolve_checkpoint_path(config, arch_name, dataset_name)
+    os.makedirs(os.path.dirname(save_file) or ".", exist_ok=True)
+    torch.save(model.state_dict(), save_file)
+    print(f"Model saved to: {save_file}")
+
     return model
 
 

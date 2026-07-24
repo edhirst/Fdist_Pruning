@@ -9,7 +9,9 @@ except Exception:
         """Minimal fallback BasePruner used for linting/tests when the real BasePruner can't be imported."""
         def __init__(self):
             pass
-import torch 
+import torch
+
+from .prunable import get_prunable_mask
 
 class MagnitudePruner(BasePruner):
     """
@@ -19,6 +21,7 @@ class MagnitudePruner(BasePruner):
     def __init__(self, threshold=0.0):
         super().__init__()
         self.threshold = float(threshold)
+        self.prunable_exclude = None
 
     def set_parameters(self, params):
         """
@@ -26,6 +29,7 @@ class MagnitudePruner(BasePruner):
         """
         if isinstance(params, dict):
             self.threshold = float(params.get("pruning_threshold", self.threshold))
+            self.prunable_exclude = params.get("prunable_exclude", self.prunable_exclude)
         else:
             # backward compatible: allow passing float directly
             self.threshold = float(params)
@@ -68,16 +72,24 @@ class MagnitudePruner(BasePruner):
         all_weights = torch.cat(weights_list, dim=0)
         prune_ratio = float(self.threshold)
 
+        # True = eligible for pruning (all-True unless prunable_exclude is set)
+        prunable_mask = get_prunable_mask(
+            model, exclude=self.prunable_exclude, requires_grad_only=True
+        ).to(all_weights.device)
+
         # Edge cases
         prune_ratio = float(self.threshold)
         if prune_ratio <= 0.0:
             return model
         if prune_ratio >= 1.0:
-            # prune everything
+            # prune everything prunable
             offset = 0
             for p in model.parameters():
                 if p.requires_grad:
-                    p.data.zero_()
+                    n = p.numel()
+                    keep = (~prunable_mask[offset:offset + n]).view_as(p)
+                    p.data.mul_(keep)
+                    offset += n
             return model
 
         # Magnitude scores
@@ -89,9 +101,9 @@ class MagnitudePruner(BasePruner):
         if k_prune <= 0:
             mask_global = torch.ones_like(magnitude_scores, dtype=torch.bool)
         elif k_prune >= total:
-            mask_global = torch.zeros_like(magnitude_scores, dtype=torch.bool)
+            mask_global = ~prunable_mask
         else:
-            active_mask = (all_weights != 0)
+            active_mask = (all_weights != 0) & prunable_mask
             active_scores = magnitude_scores[active_mask]
             active_count = int(active_mask.sum().item())
 

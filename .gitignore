@@ -5,3 +5,8 @@ tags
 runs
 testing/
 results/
+results_smoke/
+data/CIFAR10/
+outputs/
+models/smoke_*
+.venv/

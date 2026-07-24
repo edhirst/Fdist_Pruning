@@ -11,6 +11,7 @@ except Exception:
             pass
 
 from ..utils.fim_calculator import calculate_fim_nngeometry, calculate_fim_backprop
+from .prunable import get_prunable_mask
 
 class FDistOneShotPruner(BasePruner):
     """
@@ -24,6 +25,7 @@ class FDistOneShotPruner(BasePruner):
         self.threshold = float(self.parameters.get("pruning_threshold", 0.1))
         # Backend selection: "nngeometry" or "backprop"
         self.fim_calculate_method = str(self.parameters.get("fim_calculate_method", "nngeometry")).lower()
+        self.prunable_exclude = self.parameters.get("prunable_exclude", None)
         self.epsilon = 1e-6
 
     def set_parameters(self, parameters):
@@ -32,6 +34,7 @@ class FDistOneShotPruner(BasePruner):
         if not (0.0 <= self.threshold <= 1.0):
             raise ValueError(f"pruning_threshold must be in [0,1], got {self.threshold}")
         self.fim_calculate_method = str(self.parameters.get("fim_calculate_method", "nngeometry")).lower()
+        self.prunable_exclude = self.parameters.get("prunable_exclude", self.prunable_exclude)
 
     def _calculate_fim(self, model, train_loader, device="cpu"):
         """
@@ -95,8 +98,12 @@ class FDistOneShotPruner(BasePruner):
         # Combined score
         combined_scores = torch.sqrt(torch.clamp(fim_diag, min=0.0)) * flat_w.abs()
 
-        # Active-only selection to avoid wasting quota on already-zero weights
-        active_mask = (flat_w != 0)
+        # Active-only selection to avoid wasting quota on already-zero weights;
+        # restricted to prunable params
+        prunable_mask = get_prunable_mask(
+            model, exclude=self.prunable_exclude, requires_grad_only=True
+        ).to(flat_w.device)
+        active_mask = (flat_w != 0) & prunable_mask
         active_count = int(active_mask.sum().item())
         if active_count == 0:
             print(
