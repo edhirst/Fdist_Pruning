@@ -1,0 +1,72 @@
+#!/bin/bash
+#PBS -q par128
+#PBS -N fdist_exact
+#PBS -m a
+# so apenas em caso de ABORT: a grade tem ~60 jobs, "abe" geraria centenas de e-mails
+#PBS -k oe
+#PBS -j oe
+#PBS -l nodes=1:ppn=128
+# Fila par128: 1 no, 128 nucleos, 488 GB, ate 7 dias, 6 jobs simultaneos/usuario.
+# CPU (nao GPU) de proposito: o Fisher deste modelo e pequeno demais para saturar
+# uma A100 (a GPU rendeu apenas ~3.7x sobre uma CPU de laptop), e o limite de
+# jobs simultaneos e 6 aqui contra 2 em umagpu.
+
+# ---------------------------------------------------------------------------
+# APENAS o f_dist EXATO, para UMA combinacao (config, semente[, K]).
+#
+# O laco de coordenadas e dividido entre FDIST_WORKERS processos, cada um com
+# UMA thread. Isso e proposital: cada probe custa ~1.35 s num nucleo e a
+# vetorizacao interna do torch satura em ~4 threads, entao processos (nao
+# threads) sao o unico jeito de usar os 128 nucleos. O resultado e
+# bit-identico ao serial (tests/test_fisher_sharding_equivalence.py).
+#
+# Submeta a partir da raiz do repo:
+#   qsub -v CFG=configs/vit_cifar10.yaml,SEED=0 hpc/exact_fdist_par128.pbs
+#   qsub -v CFG=configs/nn_mnist.yaml,SEED=0,K=9 hpc/exact_fdist_par128.pbs
+# ---------------------------------------------------------------------------
+
+cd "$PBS_O_WORKDIR" || exit 1
+mkdir -p outputs
+# Se o repo estiver num subdir 'github', descomente:  # cd github || exit 1
+
+: "${CFG:?defina CFG, ex.: -v CFG=configs/nn_mnist.yaml,SEED=0}"
+: "${SEED:?defina SEED, ex.: -v CFG=configs/nn_mnist.yaml,SEED=0}"
+
+module load miniconda3/22.11.1-gcc-9.4.0
+source .venv/bin/activate
+
+# UM thread por processo: N processos x N threads sobrecarregaria o no e ficaria
+# mais lento que serial. O paralelismo vem de FDIST_WORKERS processos.
+NCORES=$(wc -l < "$PBS_NODEFILE" 2>/dev/null || echo 128)
+export OMP_NUM_THREADS=1
+export MKL_NUM_THREADS=1
+export FDIST_WORKERS="${FDIST_WORKERS:-$NCORES}"
+
+# K opcional (varredura de f_dist_avg_points); se ausente, usa o valor do config.
+if [[ -n "${K:-}" ]]; then
+    export FDIST_K="$K"
+fi
+
+echo "===== config=$CFG  seed=$SEED  K=${K:-config}  workers=$FDIST_WORKERS  host=$(hostname)  data=$(date) ====="
+
+export BASE_CONFIG="$CFG"
+export FDIST_SEED="$SEED"
+export SCHEMES=""              # nenhum esquema barato
+export EXACT_FDIST=yes         # somente o f_dist exato
+export SKIP_TRAIN=true         # reaproveita o checkpoint treinado pelo job de GPU
+
+chmod +x run_experiment.sh
+./run_experiment.sh
+STATUS=$?
+echo "===== fim (exit $STATUS) ====="
+
+# Movendo a saída gerada no $HOME para o diretório final após o término do job
+JOBNUM="${PBS_JOBID%%.*}"
+LIVE_FILE="$HOME/${PBS_JOBNAME}.o${JOBNUM}"
+if [[ -f "$LIVE_FILE" ]]; then
+    mv "$LIVE_FILE" "$PBS_O_WORKDIR/outputs/"
+else
+    echo "AVISO: arquivo de saída do PBS não encontrado: $LIVE_FILE"
+fi
+
+exit $STATUS

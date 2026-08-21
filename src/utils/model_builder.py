@@ -93,14 +93,19 @@ def build_model_from_config(config, dataset_name=None):
     return model, arch_name
 
 
-def resolve_checkpoint_path(config, arch_name, dataset_name):
+def resolve_checkpoint_path(config, arch_name, dataset_name, seed=None):
     """
     Explicit paths.pretrained_model_path wins (backward compatible).
-    When it is null/empty, default to {model_save_path}/{arch_name}_{dataset}.pth.
+    When it is null/empty, default to {model_save_path}/{arch_name}_{dataset}.pth,
+    or {arch_name}_{dataset}_seed{N}.pth for a multi-seed run.
+
+    `seed` must be None for single-run behaviour: multi-seed jobs each train and
+    prune their own checkpoint, so the filenames must not collide.
     """
     paths_cfg = config.get("paths", {}) or {}
     explicit = paths_cfg.get("pretrained_model_path", None)
     if explicit:
         return explicit
     save_dir = paths_cfg.get("model_save_path", "models/")
-    return os.path.join(save_dir, f"{arch_name}_{normalize_dataset_name(dataset_name)}.pth")
+    tag = "" if seed is None else f"_seed{int(seed)}"
+    return os.path.join(save_dir, f"{arch_name}_{normalize_dataset_name(dataset_name)}{tag}.pth")

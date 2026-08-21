@@ -1,18 +1,10 @@
 import torch
-import torch.nn as nn
-import numpy as np
 import copy
 
-try:
-    from .base_pruner import BasePruner
-except Exception:
-    # Fallback BasePruner for environments where the relative import is unavailable
-    class BasePruner:
-        """Minimal fallback BasePruner used for linting/tests when the real BasePruner can't be imported."""
-        def __init__(self):
-            pass
+from .base_pruner import BasePruner
 
 from ..utils.fim_calculator import calculate_fim_nngeometry, calculate_fim_backprop
+from ..utils.fisher_parallel import ProbePool, materialise_batches, resolve_workers
 from .prunable import get_prunable_mask
 
 
@@ -43,6 +35,16 @@ class FDistPruner(BasePruner):
         if self.f_dist_avg_points < 2:
             raise ValueError(f"f_dist average points must be >= 2, got {self.f_dist_avg_points}")
         self.prunable_exclude = self.parameters.get("prunable_exclude", None)
+        # forward-mode (JVP) fast path: one JVP per (coordinate, sample) instead of
+        # a full reverse-mode Fisher per coordinate. Mathematically identical --
+        # see tests/test_fisher_forward_equivalence.py (float64 rel err ~1e-16).
+        self.fast = bool(self.parameters.get("f_dist_fast", True))
+        self.probe_batch = int(self.parameters.get("f_dist_probe_batch", 32))
+        # Probe worker processes. Coordinate probes are independent and the work
+        # is compute-bound per core, so this is the knob that actually uses a big
+        # CPU node; FDIST_WORKERS / PBS_NP override the config value.
+        self.workers = resolve_workers(self.parameters.get("f_dist_workers", 1))
+        self.sample_chunk = self.parameters.get("f_dist_sample_chunk", None)
 
         # cached total prunable params (trainable params) for delta->count conversion
         self._total_params = None
@@ -68,6 +70,10 @@ class FDistPruner(BasePruner):
         if self.f_dist_avg_points < 2:
             raise ValueError(f"f_dist average points must be >= 2, got {self.f_dist_avg_points}")
         self.prunable_exclude = self.parameters.get("prunable_exclude", self.prunable_exclude)
+        self.fast = bool(self.parameters.get("f_dist_fast", self.fast))
+        self.probe_batch = int(self.parameters.get("f_dist_probe_batch", self.probe_batch))
+        self.workers = resolve_workers(self.parameters.get("f_dist_workers", self.workers))
+        self.sample_chunk = self.parameters.get("f_dist_sample_chunk", self.sample_chunk)
 
     def _calculate_fim(self, model, train_loader, device="cpu"):
         """
@@ -108,8 +114,26 @@ class FDistPruner(BasePruner):
             total += t.numel()
             nonzero += (t != 0).sum().item()
         return int(nonzero), int(total)
-    
+
     def calculate_fim_avg(self, model, train_loader, device):
+        """Average Fisher over the per-coordinate shrink path; dispatches to the
+        forward-mode fast path unless f_dist_fast=False."""
+        if self.fast:
+            return self._calculate_fim_avg_forward(model, train_loader, device)
+        return self._calculate_fim_avg_legacy(model, train_loader, device)
+
+    def _calculate_fim_avg_forward(self, model, train_loader, device):
+        """
+        Same quantity as _calculate_fim_avg_legacy, via forward-mode AD.
+
+            F_avg[i] = (1/K) * sum_alpha F_ii( theta with w_i -> alpha*w_i )
+
+        The legacy path spends one FULL reverse-mode Fisher (C backward passes
+        per sample over all P parameters) per (coordinate, alpha) and keeps a
+        single entry. Here one JVP per (coordinate, sample) yields that entry
+        directly, so the whole tensor's coordinates share one pass over the data.
+        Measured 8.9x (SimpleViT/CIFAR-10) to 325x (SimpleNN/CIFAR-10) per probe.
+        """
         model_cp = copy.deepcopy(model).to(device)
 
         if self.freeze_all_zero_tensors:
@@ -118,7 +142,60 @@ class FDistPruner(BasePruner):
                     p.requires_grad_(False)
 
         total_vec = self._flatten_all_params(model_cp).to(device)
-        
+
+        # baseline Fisher at alpha=1.0 -- one reverse pass gives every entry
+        F_base = self._calculate_fim(model_cp, train_loader, device).detach().cpu()
+        if F_base.numel() != total_vec.numel():
+            raise ValueError(
+                f"fisher_diag_sqrt length mismatch: fisher={F_base.numel()} vs params={total_vec.numel()}. "
+                "Your fisher_diag_sqrt must flatten exactly model.parameters() order."
+            )
+
+        F_avg = F_base.clone()
+        K = self.f_dist_avg_points
+        alphas = [a for a in torch.linspace(1.0, 0.0, steps=K).tolist() if abs(a - 1.0) >= 1e-12]
+
+        # Pull the Fisher subset into memory once. The serial path would otherwise
+        # re-iterate the DataLoader for every (tensor, alpha) -- ~100 passes per
+        # step on the ViT -- and forked workers must not share a live DataLoader.
+        batches = materialise_batches(train_loader)
+
+        # Sharding is CPU-only: forking a CUDA context is unsafe.
+        workers = self.workers if str(device) == "cpu" else 1
+        if self.workers > 1 and workers == 1:
+            print(f"FDist (exact): f_dist_workers={self.workers} ignored on device={device} "
+                  "(probe sharding is CPU-only)")
+
+        nonzero_all = (total_vec != 0).cpu()
+        with ProbePool(model_cp, batches, workers=workers,
+                       probe_batch=self.probe_batch, sample_chunk=self.sample_chunk) as pool:
+            if workers > 1:
+                n_probes = int(nonzero_all.sum()) * len(alphas)
+                print(f"FDist (exact): {n_probes:,} probes over {workers} worker processes")
+            offset = 0
+            for name, p in model_cp.named_parameters():
+                n = p.numel()
+                local_nz = nonzero_all[offset:offset + n].nonzero(as_tuple=False).view(-1)
+                if local_nz.numel():
+                    acc = F_base[offset:offset + n][local_nz].clone()   # the alpha=1 term
+                    for a in alphas:
+                        acc += pool.run(name, local_nz,
+                                        torch.full((local_nz.numel(),), float(a)))
+                    F_avg[offset + local_nz] = acc / float(K)
+                offset += n
+
+        return F_avg  # CPU 1D
+
+    def _calculate_fim_avg_legacy(self, model, train_loader, device):
+        model_cp = copy.deepcopy(model).to(device)
+
+        if self.freeze_all_zero_tensors:
+            for p in model_cp.parameters():
+                if torch.all(p == 0):
+                    p.requires_grad_(False)
+
+        total_vec = self._flatten_all_params(model_cp).to(device)
+
         # idx -> (param_tensor, local_index) mapping in flatten order
         idx2tensor = {}
         offset = 0
@@ -170,12 +247,12 @@ class FDistPruner(BasePruner):
     def apply_pruning(self, model, train_loader=None, device="cpu",):
         if train_loader is None:
             raise ValueError("FDistPruner requires train_loader")
-        
+
         before_nz, total_params_runtime = self._count_nonzero_and_total_prunable(model)
         if total_params_runtime == 0:
             print("FDist (exact): Pruned 0/0 parameters (0.00%), Remaining 0")
             return model
-        
+
         model.to(device)
 
         # cache total prunable params once

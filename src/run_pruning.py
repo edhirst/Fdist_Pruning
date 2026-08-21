@@ -1,22 +1,20 @@
 import os
 import sys
 import yaml
-import numpy as np
 import copy
 import torch
-import torch.nn as nn
 import matplotlib
 matplotlib.use("Agg")  # headless-safe (HPC compute nodes have no display)
 import matplotlib.pyplot as plt
 import json
+import time
 from datetime import datetime
 from torch.utils.data import DataLoader, Subset
 
 from .utils.data_loader import build_dataloaders
 from .utils.model_builder import build_model_from_config, get_model_type, resolve_checkpoint_path
 from .utils.evaluation import (
-    evaluate_accuracy, evaluate_precision, evaluate_f1, evaluate_mcc,
-    get_model_size_kb, count_nonzero_params, calculate_auc
+    evaluate_metrics, get_model_size_kb, count_nonzero_params, calculate_auc
 )
 
 # Pruners
@@ -27,16 +25,38 @@ from .pruning.f_dist_iterative import FDistIterativePruner
 from .pruning.f_dist import FDistPruner
 from .pruning.f_dist_global import FDistGlobalPruner
 from .pruning.prunable import resolve_prunable_exclude
+from .utils.seeding import resolve_seed, seed_everything
+from .utils.fisher_parallel import resolve_workers
 
 # Schemes whose scoring needs Fisher information (and hence a train_loader)
 FIM_SCHEMES = {"fim", "f_dist_one_shot", "f_dist_iterative", "f_dist", "f_dist_global"}
+
+# evaluation.metrics -> (results-JSON key, plot y-label, plot filename stem).
+# Insertion order is the canonical order: it fixes the column order in the printed
+# sweep and the key order in the results JSON. The values themselves come from
+# evaluation.evaluate_metrics, which derives all of them from one forward pass.
+METRIC_REGISTRY = {
+    "accuracy":  ("acc_norm", "Normalized Accuracy", "accuracy"),
+    "precision": ("precision_norm", "Normalized Precision", "precision"),
+    "f1":        ("f1_norm", "Normalized F1-score", "f1"),
+    "mcc":       ("mcc_norm", "Normalized MCC", "mcc"),
+}
+METRIC_ALIASES = {"acc": "accuracy", "f1-score": "f1", "f1_score": "f1", "f-score": "f1",
+                  "matthews": "mcc", "matthews_corrcoef": "mcc"}
+
+# Schemes the magnitude warm-start applies to
+FDIST_FAMILY = ("f_dist", "f_dist_iterative", "f_dist_global", "f_dist_one_shot")
+
+# Schemes that step a running model by a delta each sweep point, rather than
+# re-pruning a fresh copy of the baseline to an absolute ratio
+ITERATIVE_SCHEMES = ("f_dist_iterative", "f_dist_global", "f_dist")
 
 
 # load config from yaml
 def load_config(config_path: str):
     with open(config_path, "r", encoding='utf-8') as file:
         config = yaml.safe_load(file)
-    
+
     return config
 
 
@@ -102,6 +122,38 @@ def make_fim_loader_subset(train_loader, subset_size: int, seed: int, shuffle: b
                       num_workers=nw, pin_memory=pm, persistent_workers=(nw > 0))
 
 
+def resolve_metrics(config):
+    """
+    Which metrics to evaluate at every sweep point (`evaluation.metrics`).
+
+    Defaults to all of them, which is what the paper runs. They are all derived
+    from a single forward pass (see evaluation.evaluate_metrics), so trimming the
+    list changes what is recorded rather than what it costs. Accuracy cannot be
+    dropped: the plots, the AUC and src/aggregate_results.py are keyed on
+    acc_norm.
+    """
+    raw = (config.get("evaluation", {}) or {}).get("metrics")
+    if raw is None:
+        return list(METRIC_REGISTRY)
+    if isinstance(raw, str):
+        raw = [raw]
+
+    chosen = set()
+    for item in raw:
+        key = str(item).strip().lower()
+        key = METRIC_ALIASES.get(key, key)
+        if key not in METRIC_REGISTRY:
+            raise ValueError(
+                f"Unknown evaluation.metrics entry {item!r}. Supported: "
+                f"{', '.join(METRIC_REGISTRY)} (aliases: {', '.join(METRIC_ALIASES)})."
+            )
+        chosen.add(key)
+    if "accuracy" not in chosen:
+        raise ValueError("evaluation.metrics must include 'accuracy': the pruning "
+                         "curves, the AUC and the results tables are all keyed on it.")
+    return [m for m in METRIC_REGISTRY if m in chosen]
+
+
 def build_pruner(config, scheme: str):
     """
     Return a pruner instance. We will always call:
@@ -144,6 +196,10 @@ def build_pruner(config, scheme: str):
             "freeze_all_zero_tensors": True,
             "f_dist_avg_points": p_cfg.get("f_dist_avg_points", 2),
             "prunable_exclude": prunable_exclude,
+            # forward-mode (JVP) fast path; identical output, ~9-325x per probe.
+            # See tests/test_fdist_fast_equivalence.py.
+            "f_dist_fast": p_cfg.get("f_dist_fast", True),
+            "f_dist_probe_batch": p_cfg.get("f_dist_probe_batch", 32),
         })
 
     if scheme == "f_dist_global":
@@ -180,8 +236,8 @@ def plot_metric(ratios, values, ylabel, save_path=None, dpi=300):
     plt.figure(figsize=(10, 6))
     plt.plot(ratios, values, marker="o")
     plt.grid(True, alpha=0.5)
-    plt.xlabel("Pruning ratio", fontdict= {"fontsize": 14})
-    plt.ylabel(ylabel, fontdict= {"fontsize": 14})
+    plt.xlabel("Pruning ratio", fontdict={"fontsize": 14})
+    plt.ylabel(ylabel, fontdict={"fontsize": 14})
 
     # normalized metric range
     plt.ylim(-0.05, 1.05)
@@ -201,6 +257,23 @@ def main():
         return
 
     scheme = str(p_cfg.get("pruning_scheme", "magnitude")).lower()
+    metric_names = resolve_metrics(config)
+
+    # FDIST_K overrides pruning.f_dist_avg_points, so one config drives the whole
+    # K-sweep (how the exact-f_dist path-average converges, and what it costs).
+    _k_env = os.environ.get("FDIST_K")
+    k_override = None
+    if _k_env is not None and _k_env.strip() != "":
+        k_override = int(_k_env)
+        if k_override < 2:
+            raise ValueError(f"FDIST_K must be >= 2, got {k_override}")
+        p_cfg["f_dist_avg_points"] = k_override
+        print(f"f_dist_avg_points (K): {k_override}  [FDIST_K]")
+
+    run_seed = resolve_seed(config)
+    if run_seed is not None:
+        seed_everything(run_seed)
+        print(f"seed: {run_seed}")
 
     device = get_device()
     model_type = get_model_type(config)
@@ -227,7 +300,7 @@ def main():
     model, arch_name = build_model_from_config(config, dataset_name=dataset_name)
     model = model.to(device)
 
-    ckpt_path = resolve_checkpoint_path(config, arch_name, dataset_name)
+    ckpt_path = resolve_checkpoint_path(config, arch_name, dataset_name, seed=run_seed)
     if not os.path.isfile(ckpt_path):
         raise FileNotFoundError(
             f"Checkpoint not found: {ckpt_path}. Train it first: python -m src.train_model"
@@ -264,7 +337,7 @@ def main():
     # Get fold info for directory naming
     cv_cfg = config.get("cross_validation", {}) or {}
     current_fold = cv_cfg.get("current_fold", None)
-    
+
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     fold_suffix = f"_fold{current_fold}" if current_fold is not None else ""
 
@@ -275,8 +348,11 @@ def main():
     paths_cfg = config.get("paths", {}) or {}
     results_root = os.environ.get("FDIST_RESULTS_DIR") or paths_cfg.get("results_dir") or "results"
     run_group = f"{arch_name}_{dataset_name}"
+    seed_suffix = "" if run_seed is None else f"_seed{run_seed}"
+    k_suffix = f"_K{k_override}" if k_override is not None else ""
     results_dir = os.path.join(
-        results_root, run_group, f"{scheme}_pruning_result_figure_{timestamp}{fold_suffix}"
+        results_root, run_group,
+        f"{scheme}_pruning_result_figure_{timestamp}{fold_suffix}{seed_suffix}{k_suffix}"
     )
     os.makedirs(results_dir, exist_ok=True)
     if save_plots:
@@ -284,27 +360,21 @@ def main():
     else:
         print(f"Plot saving disabled (save_plots=False). Results JSON only: {results_dir}")
 
-    # Baseline evaluation
-    base_acc = evaluate_accuracy(model, test_loader, device=device)
-    base_prec = evaluate_precision(model, test_loader, device=device)
-    base_f1 = evaluate_f1(model, test_loader, device=device)
-    base_mcc = evaluate_mcc(model, test_loader, device=device)
+    # Baseline evaluation. Every curve is normalised by these, so 1.0 always means
+    # "as good as the dense model"; eps guards a baseline that is itself ~0.
+    eps = 1e-12
+    baselines = {name: max(value, eps) for name, value
+                 in evaluate_metrics(model, test_loader, metric_names, device=device).items()}
     base_nonzero, base_total = count_nonzero_params(model)
     base_size_kb = get_model_size_kb(model)
-
-    # Safety guards for normalization
-    eps = 1e-12
-    base_acc = max(base_acc, eps)
-    base_prec = max(base_prec, eps)
-    base_f1 = max(base_f1, eps)
-    base_mcc = max(base_mcc, eps)
 
 
     print(f"Device: {device}")
     print(f"Dataset: {dataset_name}")
     print(f"Model: {arch_name}")
     print(f"Checkpoint: {ckpt_path}")
-    print(f"Baseline | acc={base_acc*100:.2f}% prec={base_prec:.4f} f1={base_f1:.4f} mcc={base_mcc:.4f}")
+    print("Baseline | " + f"acc={baselines['accuracy']*100:.2f}%"
+          + "".join(f" {n}={baselines[n]:.4f}" for n in metric_names if n != "accuracy"))
     print(f"Baseline | nonzero={base_nonzero}/{base_total} size={base_size_kb:.2f}KB")
     print("-" * 80)
 
@@ -314,6 +384,8 @@ def main():
     if use_fim_loader:
         fim_subset_size = int(p_cfg.get("fim_subset_size", 0))
         fim_seed = int(p_cfg.get("fim_subset_seed", 42))
+        if run_seed is not None:
+            fim_seed += run_seed
         fim_shuffle = bool(p_cfg.get("fim_subset_shuffle", True))
         if fim_subset_size > 0:
             fim_loader = make_fim_loader_subset(train_loader, fim_subset_size, fim_seed, fim_shuffle)
@@ -325,7 +397,6 @@ def main():
     # Magnitude warm-start config: for the f_dist family, prune 0->warm_ratio by
     # magnitude and only run the expensive f_dist scheme for the warm_ratio->end
     # tail (the full curve is still produced). Does not touch magnitude/fim.
-    FDIST_FAMILY = ("f_dist", "f_dist_iterative", "f_dist_global", "f_dist_one_shot")
     warm_cfg = p_cfg.get("warm_start", {}) or {}
     warm_enabled = bool(warm_cfg.get("enabled", True))
     warm_ratio = min(1.0, max(0.0, float(warm_cfg.get("ratio", 0.8))))
@@ -346,39 +417,49 @@ def main():
         },
         "results": {
             "pruning_ratio": [],
-            "acc_norm": [],
-            "precision_norm": [],
-            "f1_norm": [],
-            "mcc_norm": [],
+            **{METRIC_REGISTRY[n][0]: [] for n in metric_names},
         }
     }
 
+    # Wall-clock accounting. `sweep_seconds` is the number the paper's compute
+    # column reports: everything from the first pruning step to the last
+    # evaluation, excluding process start-up, data loading and baseline eval.
+    sweep_t0 = time.perf_counter()
+    step_times = []
+    last_t = sweep_t0
+
     def _eval_and_record(m, r):
         """Evaluate model m at sparsity r and append normalized metrics + print."""
-        acc = evaluate_accuracy(m, test_loader, device=device)
-        prec = evaluate_precision(m, test_loader, device=device)
-        f1 = evaluate_f1(m, test_loader, device=device)
-        mcc = evaluate_mcc(m, test_loader, device=device)
+        vals = evaluate_metrics(m, test_loader, metric_names, device=device)
         results_json["results"]["pruning_ratio"].append(r)
-        results_json["results"]["acc_norm"].append(acc / base_acc)
-        results_json["results"]["precision_norm"].append(prec / base_prec)
-        results_json["results"]["f1_norm"].append(f1 / base_f1)
-        results_json["results"]["mcc_norm"].append(mcc / base_mcc)
-        print(f"pruning ratio: {r*100:>5.1f}%, accuracy: {acc*100:.2f}% | precision: {prec:.4f} | f1: {f1:.4f} | mcc: {mcc:.4f}")
+        for name, v in vals.items():
+            results_json["results"][METRIC_REGISTRY[name][0]].append(v / baselines[name])
+        nonlocal last_t
+        now = time.perf_counter()
+        step_times.append(now - last_t)
+        last_t = now
+        print(f"pruning ratio: {r*100:>5.1f}%, accuracy: {vals['accuracy']*100:.2f}%"
+              + "".join(f" | {n}: {vals[n]:.4f}" for n in metric_names if n != "accuracy")
+              + f" | {step_times[-1]:.2f}s")
 
 
     # One-shot sweep: to guarantee exact prune ratio semantics (prune ratio of original),
     # we evaluate each ratio from a fresh copy of the baseline model.
     # This avoids ambiguity when zeros accumulate across steps.
-    if scheme in ("f_dist_iterative", "f_dist_global"):
+    if scheme in ITERATIVE_SCHEMES:
+        # Delta-stepped schemes: one running model advanced by `step` at each sweep
+        # point, so the Fisher is always recomputed on the current pruned state.
         pruner = build_pruner(config, scheme)
-
-        pruner.set_parameters({
-            "fim_calculate_method": str(p_cfg.get("fim_calculate_method", "nngeometry")).lower(),
+        params = {
+            "fim_calculate_method": fim_method,
             "pruning_step": step,
-            "f_dist_avg_points": p_cfg.get("f_dist_avg_points", 3),
             "prunable_exclude": prunable_exclude,
-        })
+        }
+        if scheme != "f_dist":
+            # Exact f_dist takes K from build_pruner (whose default differs); the
+            # others are explicit here.
+            params["f_dist_avg_points"] = p_cfg.get("f_dist_avg_points", 3)
+        pruner.set_parameters(params)
 
         pruned_model = None        # f_dist working model, initialised lazily
         last_warm_ratio = start    # magnitude sparsity where f_dist takes over
@@ -387,7 +468,7 @@ def main():
             if abs(r - start) < 1e-12:
                 m = baseline_model
             elif use_warm and r <= warm_ratio + 1e-12:
-                # warm phase: cheap magnitude point
+                # warm phase: cheap magnitude point (no Fisher eval)
                 m = _magnitude_pruned_copy(baseline_model, r, start, prunable_exclude, device)
                 last_warm_ratio = r
             else:
@@ -402,37 +483,10 @@ def main():
 
             _eval_and_record(m, r)
 
-    elif scheme == "f_dist":
-        pruner = build_pruner(config, scheme)
-
-        pruner.set_parameters({
-            "fim_calculate_method": str(p_cfg.get("fim_calculate_method", "nngeometry")).lower(),
-            "pruning_step": step,
-            "prunable_exclude": prunable_exclude,
-        })
-
-        pruned_model = None        # f_dist working model, initialised lazily
-        last_warm_ratio = start    # magnitude sparsity where f_dist takes over
-
-        for r in ratios:
-            if abs(r - start) < 1e-12:
-                m = baseline_model
-            elif use_warm and r <= warm_ratio + 1e-12:
-                m = _magnitude_pruned_copy(baseline_model, r, start, prunable_exclude, device)
-                last_warm_ratio = r
-            else:
-                if pruned_model is None:
-                    pruned_model = (
-                        _magnitude_pruned_copy(baseline_model, last_warm_ratio, start, prunable_exclude, device)
-                        if use_warm else copy.deepcopy(baseline_model).to(device)
-                    )
-                pruned_model = pruner.apply_pruning(pruned_model, train_loader=fim_loader, device=device)
-                m = pruned_model
-
-            _eval_and_record(m, r)
-
     else:
-        # code for "magnitude", "fim", "f_dist_one_shot"
+        # One-shot schemes (magnitude, fim, f_dist_one_shot): each sweep point is
+        # pruned from a fresh copy of the baseline to the absolute target ratio, so
+        # zeros never accumulate ambiguously across steps.
         for r in ratios:
             pruned_model = copy.deepcopy(baseline_model).to(device)
 
@@ -448,7 +502,7 @@ def main():
             elif scheme == "fim":
                 pruner.set_parameters({
                     "pruning_threshold": delta,
-                    "fim_calculate_method": str(p_cfg.get("fim_calculate_method", "nngeometry")).lower(),
+                    "fim_calculate_method": fim_method,
                     "prunable_exclude": prunable_exclude,
                 })
                 pruned_model = pruner.apply_pruning(pruned_model, train_loader=fim_loader, device=device)
@@ -471,10 +525,9 @@ def main():
                         os_delta = max(0.0, float(r - warm_ratio))
                     else:
                         os_delta = delta
-                    # assumes its apply_pruning uses its internal thresholds
                     pruner.set_parameters({
                         "pruning_threshold": os_delta,
-                        "fim_calculate_method": str(p_cfg.get("fim_calculate_method", "nngeometry")).lower(),
+                        "fim_calculate_method": fim_method,
                         "prunable_exclude": prunable_exclude,
                     })
                     pruned_model = pruner.apply_pruning(pruned_model, train_loader=fim_loader, device=device)
@@ -482,35 +535,14 @@ def main():
             else:
                 raise ValueError(f"Unknown scheme: {scheme}")
 
-            # Evaluate
-            acc = evaluate_accuracy(pruned_model, test_loader, device=device)
-            prec = evaluate_precision(pruned_model, test_loader, device=device)
-            f1 = evaluate_f1(pruned_model, test_loader, device=device)
-            mcc = evaluate_mcc(pruned_model, test_loader, device=device)
-
-            results_json["results"]["pruning_ratio"].append(r)
-            results_json["results"]["acc_norm"].append(acc / base_acc)
-            results_json["results"]["precision_norm"].append(prec / base_prec)
-            results_json["results"]["f1_norm"].append(f1 / base_f1)
-            results_json["results"]["mcc_norm"].append(mcc / base_mcc)
-
-
-            # Print in the format you asked for (and keep extra metrics for debugging)
-            print(f"pruning ratio: {r*100:>5.1f}%, accuracy: {acc*100:.2f}% | precision: {prec:.4f} | f1: {f1:.4f} | mcc: {mcc:.4f}")
+            _eval_and_record(pruned_model, r)
 
 
     # Plots (4 separate figures)
     ratios = results_json["results"]["pruning_ratio"]
 
     if save_plots:
-        metrics = [
-            ("acc_norm", "Normalized Accuracy", "accuracy"),
-            ("precision_norm", "Normalized Precision", "precision"),
-            ("f1_norm", "Normalized F1-score", "f1"),
-            ("mcc_norm", "Normalized MCC", "mcc"),
-        ]
-
-        for metric_key, ylabel, metric_name in metrics:
+        for metric_key, ylabel, metric_name in (METRIC_REGISTRY[n] for n in metric_names):
             for fmt in plot_formats:
                 save_path = os.path.join(results_dir, f"{scheme}_{metric_name}.{fmt}")
                 plot_metric(ratios, results_json["results"][metric_key],
@@ -520,10 +552,36 @@ def main():
     # AUC of each normalized-metric curve over the swept range (higher = accuracy
     # retained longer under pruning)
     results_json["auc"] = {
-        key: calculate_auc(ratios, results_json["results"][key])
-        for key in ("acc_norm", "precision_norm", "f1_norm", "mcc_norm")
+        METRIC_REGISTRY[n][0]: calculate_auc(ratios, results_json["results"][METRIC_REGISTRY[n][0]])
+        for n in metric_names
     }
     print("AUC:", {k: round(v, 4) for k, v in results_json["auc"].items()})
+
+    # Compute cost of this run (the paper's "avg compute time" column) plus the
+    # context needed to interpret it -- a time is meaningless without the device
+    # and thread count it was measured on.
+    results_json["timing"] = {
+        "sweep_seconds": time.perf_counter() - sweep_t0,
+        "step_seconds": step_times,
+        "n_steps": len(step_times),
+        "device": str(device),
+        "torch_threads": torch.get_num_threads(),
+        # how the exact-f_dist probes were parallelised; a compute time is only
+        # comparable against another measured the same way
+        "probe_workers": (resolve_workers(p_cfg.get("f_dist_workers", 1))
+                          if scheme == "f_dist" else 1),
+    }
+    results_json["metadata"]["seed"] = run_seed
+    results_json["metadata"]["sweep"] = {"start": start, "end": end, "step": step}
+    # K only means something for the schemes that actually average along the path;
+    # recording it for magnitude/fim would split their groups on a phantom key.
+    results_json["metadata"]["f_dist_avg_points"] = (
+        p_cfg.get("f_dist_avg_points", 3) if scheme in ("f_dist", "f_dist_global") else None
+    )
+    results_json["metadata"]["fim_subset_size"] = int(p_cfg.get("fim_subset_size", 0))
+    results_json["metadata"]["metrics"] = metric_names
+    print(f"sweep wall-clock: {results_json['timing']['sweep_seconds']:.1f}s "
+          f"on {results_json['timing']['device']}")
 
     json_path = os.path.join(results_dir, f"{scheme}_results.json")
     with open(json_path, "w") as f:

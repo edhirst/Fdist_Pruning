@@ -1,12 +1,21 @@
-# SimpleNN (2x64 MLP) on CIFAR-10 — full train + all pruning schemes.
-# Generated from src/config.yaml (model_type pinned to nn, fim_device=auto for CUDA).
-# Run:  ./try-script.sh configs/nn_cifar10.yaml
+# SimpleNN (2x64 MLP) on CIFAR-10 -- full train + pruning schemes, for the multi-seed paper table.
+# Run:  BASE_CONFIG=configs/nn_cifar10.yaml FDIST_SEED=<n> ./run_experiment.sh
+#
+# sweep.step = 0.1 for every scheme so the AUC column is internally
+# comparable; re-integrating the previous 0.05 curves at 0.1 moved AUC by
+# <= 0.002, and it halves the exact-f_dist cost, which dominates everything.
+# experiment.seed is overridden per job by the FDIST_SEED env var.
+# warm_start is OFF so the f_dist family is tested over the full 0->100%%.
 
+experiment:
+  seed: 0
 paths:
   pretrained_model_path: null
-  dataset_path: data/
+  # Root the torchvision datasets live under; hpc/prep_data.sh stages into it.
+  dataset_path: data
   model_save_path: models/
-  log_path: logs/
+  # Per-stage logs from run_experiment.sh are tee'd here; null disables them.
+  log_path: logs
   results_dir: results
 dataset:
   name: cifar10
@@ -53,24 +62,32 @@ pruning:
   sweep:
     start: 0.0
     end: 1.0
-    step: 0.05
+    step: 0.1
   f_dist_avg_points: 3
-  # OFF for the research runs so the f_dist family (especially f_dist_global) is
-  # tested over the FULL 0->100% range instead of only the high-sparsity tail.
-  # Full-range f_dist_global is ~13 min on CPU (faster on the A100), so there is
-  # no walltime reason to warm-start it here. Set enabled: true to focus f_dist on
-  # the tail (e.g. to make exact f_dist tractable on MNIST).
   warm_start:
     enabled: false
     ratio: 0.8
+  f_dist_fast: true
+  f_dist_probe_batch: 32
+  # Probe worker processes for exact f_dist. 1 = serial; the par128 job sets
+  # FDIST_WORKERS=<cores>, which overrides this. Sharding is by coordinate and
+  # is bit-identical to serial (tests/test_fisher_sharding_equivalence.py).
+  f_dist_workers: 1
 evaluation:
+  # Which metrics are evaluated at every sweep point and written to the results
+  # JSON. All four is what the paper runs. They share one forward pass over the
+  # test set, so trimming the list changes what is RECORDED, not the runtime.
+  # 'accuracy' is required -- the plots, the AUC and src/aggregate_results.py are
+  # all keyed on it. Accepted: accuracy, precision, f1, mcc.
   metrics:
   - accuracy
-  - loss
   - precision
-  - f1-score
+  - f1
   - mcc
-  validation_split: 0.2
+  # Fraction of the TRAIN split held out to report validation loss/accuracy each
+  # epoch. 0 = train on everything, which is what the paper runs; raise it while
+  # developing to watch for overfitting without touching the test set.
+  validation_split: 0.0
 cross_validation:
   num_folds: 1
 plots:

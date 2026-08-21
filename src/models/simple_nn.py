@@ -1,6 +1,5 @@
 import torch.nn as nn
-import torch.nn.functional as F
-    
+
 class SimpleNN(nn.Module):
     def __init__(self, input_size=784, hidden_size=32, hidden_layers=2, num_classes=10):
         super(SimpleNN, self).__init__()

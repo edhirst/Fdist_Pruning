@@ -34,9 +34,9 @@ class SimpleCNN(nn.Module):
                 self.optimizer.step()
 
 
-# replace num_class with config=config 
-# config will be a dict 
-# replace all the numbers hard coded in into a for loop to come from the config file 
-# ask claude to write a yaml importing file 
-# in main training scripthave a line that calls the config and parse it that's been imported 
-# have all yaml files into 1 
+# replace num_class with config=config
+# config will be a dict
+# replace all the numbers hard coded in into a for loop to come from the config file
+# ask claude to write a yaml importing file
+# in main training scripthave a line that calls the config and parse it that's been imported
+# have all yaml files into 1

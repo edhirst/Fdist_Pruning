@@ -12,17 +12,68 @@ PRUNE_MODULE=${PRUNE_MODULE:-src.run_pruning}
 # Set PARALLEL_FOLDS=false or unset to run sequentially (default)
 PARALLEL_FOLDS=${PARALLEL_FOLDS:-false}
 
+# SCHEMES: which pruning schemes to run, space separated. Default is every cheap
+# scheme; exact "f_dist" is appended only when EXACT_FDIST=auto resolves to yes
+# (see below) or when you name it explicitly. Splitting the schemes across jobs
+# is what lets the cheap sweeps run on a GPU queue while exact f_dist runs on a
+# big CPU node.
+# NOTE: "-" not ":-" -- an explicitly EMPTY SCHEMES must mean "no cheap schemes"
+# (the par128 exact-f_dist job sets SCHEMES=""). With ":-" bash would substitute
+# the default for the empty string and the job would rerun every cheap scheme,
+# silently duplicating results at the same seed.
+SCHEMES=${SCHEMES-"magnitude fim f_dist_one_shot f_dist_iterative f_dist_global"}
+
+# EXACT_FDIST: yes | no | auto. "auto" appends exact f_dist only for the small
+# NN on 28x28 data, which was the only place it used to be affordable.
+EXACT_FDIST=${EXACT_FDIST:-auto}
+
+# SKIP_TRAIN=true reuses an existing checkpoint (so the exact-f_dist job does not
+# retrain the model the cheap-scheme job already trained for this same seed).
+SKIP_TRAIN=${SKIP_TRAIN:-false}
+
+# Seed/K tag for log file names, so concurrent runs never share a log file.
+RUN_TAG=""
+[[ -n "${FDIST_SEED:-}" ]] && RUN_TAG="_seed${FDIST_SEED}"
+[[ -n "${FDIST_K:-}" ]] && RUN_TAG="${RUN_TAG}_K${FDIST_K}"
+
 # ========================
 
-# Read num_folds from the active config (BASE_CONFIG, default src/config.yaml)
-NUM_FOLDS=$($PYTHON - "$BASE_CONFIG" <<'PY'
+# Read the settings this script needs out of the active config in one go
+# (BASE_CONFIG, default src/config.yaml).
+CFG_INFO=$($PYTHON - "$BASE_CONFIG" <<'PY'
 import sys, yaml
 cfg = yaml.safe_load(open(sys.argv[1], "r"))
-print(cfg.get("cross_validation", {}).get("num_folds", 1))
+folds = (cfg.get("cross_validation", {}) or {}).get("num_folds", 1)
+# paths.log_path: where per-stage logs are tee'd. null/"" turns logging off.
+log = (cfg.get("paths", {}) or {}).get("log_path") or "-"
+print(folds, log)
 PY
 )
+NUM_FOLDS=${CFG_INFO%% *}
+LOG_DIR=${CFG_INFO#* }
+[[ "$LOG_DIR" == "-" ]] && LOG_DIR=""
+# FDIST_LOG_DIR overrides the config, e.g. to send logs to node-local scratch.
+LOG_DIR=${FDIST_LOG_DIR:-$LOG_DIR}
+CFG_TAG=$(basename "$BASE_CONFIG" .yaml)
+
+# Run one pipeline stage, tee'ing its output into paths.log_path so a local run
+# leaves the same durable record the PBS jobs get from their queue output. With
+# no log_path configured the command just writes to stdout, as it did before.
+# `set -o pipefail` is in effect, so a failing python still fails the pipeline.
+run_stage() {
+  local label="$1"; shift
+  if [[ -z "$LOG_DIR" ]]; then
+    "$@"
+    return
+  fi
+  mkdir -p "$LOG_DIR"
+  local log_file="${LOG_DIR}/${CFG_TAG}_${label}_$(date +%Y%m%d_%H%M%S).log"
+  echo "  log: ${log_file}"
+  "$@" 2>&1 | tee "$log_file"
+}
 
 echo "Cross-validation folds: ${NUM_FOLDS}"
+[[ -n "$LOG_DIR" ]] && echo "Stage logs: ${LOG_DIR}/"
 if [[ "$PARALLEL_FOLDS" == "true" ]]; then
   echo "Mode: PARALLEL (all folds run simultaneously - requires ${NUM_FOLDS}x RAM)"
 else
@@ -37,8 +88,12 @@ run_fold() {
   echo "======================================================================"
   echo
 
-  echo "==[1/7] Train model with config: ${BASE_CONFIG} =="
-  $PYTHON -m "$TRAIN_MODULE" "$BASE_CONFIG"
+  if [[ "$SKIP_TRAIN" == "true" ]]; then
+    echo "==[train] SKIP_TRAIN=true -> reusing existing checkpoint =="
+  else
+    echo "==[train] Train model with config: ${BASE_CONFIG} =="
+    run_stage "train_fold${fold}${RUN_TAG}" $PYTHON -m "$TRAIN_MODULE" "$BASE_CONFIG"
+  fi
 
 
   # Model type, canonical dataset, and the checkpoint path resolved the same
@@ -47,11 +102,12 @@ run_fold() {
 import sys, yaml
 from src.utils.data_loader import normalize_dataset_name
 from src.utils.model_builder import build_model_from_config, resolve_checkpoint_path
+from src.utils.seeding import resolve_seed
 cfg = yaml.safe_load(open(sys.argv[1], "r"))
 mt = str(((cfg.get("model", {}) or {}).get("common", {}) or {}).get("model_type", "NN")).strip().lower()
 ds = normalize_dataset_name((cfg.get("dataset", {}) or {}).get("name", "mnist"))
 _, arch = build_model_from_config(cfg, dataset_name=ds)
-print(mt, ds, resolve_checkpoint_path(cfg, arch, ds))
+print(mt, ds, resolve_checkpoint_path(cfg, arch, ds, seed=resolve_seed(cfg)))
 PY
 )"
 
@@ -93,49 +149,34 @@ PY
     echo "$out_cfg"
   }
 
-  echo "==[2/7] Run MAGNITUDE pruning =="
-  CFG_MAG=$(make_tmp_cfg "magnitude")
-  $PYTHON -m "$PRUNE_MODULE" "$CFG_MAG"
-  rm -f "$CFG_MAG"
+  # Resolve the scheme list for this job
+  RUN_SCHEMES="$SCHEMES"
+  case "$EXACT_FDIST" in
+    yes) RUN_SCHEMES="$RUN_SCHEMES f_dist" ;;
+    no)  ;;
+    auto)
+      if [[ "$MODEL_TYPE" == "nn" && ( "$DATASET" == "mnist" || "$DATASET" == "fashion_mnist" ) ]]; then
+        RUN_SCHEMES="$RUN_SCHEMES f_dist"
+      else
+        echo "EXACT_FDIST=auto -> skipping exact f_dist (model_type=${MODEL_TYPE}, dataset=${DATASET})."
+        echo "  Set EXACT_FDIST=yes to run it anyway (needs the forward-mode fast path; see hpc/README.md)."
+      fi ;;
+    *) echo "ERROR: EXACT_FDIST must be yes|no|auto, got '${EXACT_FDIST}'"; exit 1 ;;
+  esac
+
+  echo "Schemes to run: ${RUN_SCHEMES}"
   echo
 
-  echo "==[3/7] Run FIM (Fisher) pruning =="
-  CFG_FIM=$(make_tmp_cfg "fim")
-  $PYTHON -m "$PRUNE_MODULE" "$CFG_FIM"
-  rm -f "$CFG_FIM"
-  echo
-
-  echo "==[4/7] Run F_DIST_ONE_SHOT (FIM x Magnitude One-Shot) pruning =="
-  CFG_FDIST_OS=$(make_tmp_cfg "f_dist_one_shot")
-  $PYTHON -m "$PRUNE_MODULE" "$CFG_FDIST_OS"
-  rm -f "$CFG_FDIST_OS"
-  echo
-
-  echo "==[5/7] Run F_DIST_ITERATIVE (FIM x Magnitude Iterative) pruning =="
-  CFG_FDIST_IT=$(make_tmp_cfg "f_dist_iterative")
-  $PYTHON -m "$PRUNE_MODULE" "$CFG_FDIST_IT"
-  rm -f "$CFG_FDIST_IT"
-  echo
-
-  echo "==[6/7] Run F_DIST_GLOBAL (Fisher-distance, batched alpha-scan) pruning =="
-  CFG_FDIST_GL=$(make_tmp_cfg "f_dist_global")
-  $PYTHON -m "$PRUNE_MODULE" "$CFG_FDIST_GL"
-  rm -f "$CFG_FDIST_GL"
-  echo
-
-  # Exact per-coordinate f_dist: ~#active-weights full Fisher evals per step,
-  # only feasible for the small NN on 28x28 datasets (~55k params; the cifar10
-  # NN has ~201k and the ViT ~546k).
-  if [[ "$MODEL_TYPE" == "nn" && ( "$DATASET" == "mnist" || "$DATASET" == "fashion_mnist" ) ]]; then
-    echo "==[7/7] Run F_DIST (exact Fisher-distance) pruning =="
-    CFG_FDIST=$(make_tmp_cfg "f_dist")
-    $PYTHON -m "$PRUNE_MODULE" "$CFG_FDIST"
-    rm -f "$CFG_FDIST"
+  i=0
+  total=$(wc -w <<< "$RUN_SCHEMES" | tr -d " ")
+  for scheme in $RUN_SCHEMES; do
+    i=$((i + 1))
+    echo "==[${i}/${total}] Run ${scheme} pruning =="
+    CFG_TMP=$(make_tmp_cfg "$scheme")
+    run_stage "${scheme}_fold${fold}${RUN_TAG}" $PYTHON -m "$PRUNE_MODULE" "$CFG_TMP"
+    rm -f "$CFG_TMP"
     echo
-  else
-    echo "==[7/7] Skipping exact f_dist (model_type=${MODEL_TYPE}, dataset=${DATASET}; infeasible at this scale) =="
-    echo
-  fi
+  done
 
   echo "Fold ${fold}/${NUM_FOLDS} complete."
   echo

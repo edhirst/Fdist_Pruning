@@ -1,18 +1,24 @@
-# SMOKE test config (NOT a research run): 2-epoch SimpleViT on CIFAR-10 + a
-# coarse pruning sweep, to confirm the cluster environment/GPU/pipeline end-to-end
-# within the testegpu 30-min limit. Isolated outputs (models/smoke_*, results_smoke/).
-# Run:  BASE_CONFIG=configs/smoke_vit_cifar10.yaml ./run_experiment.sh
+# SimpleViT (compact Vision Transformer) on MNIST -- full train + pruning schemes, for the multi-seed paper table.
+# Run:  BASE_CONFIG=configs/vit_mnist.yaml FDIST_SEED=<n> ./run_experiment.sh
+#
+# sweep.step = 0.1 for every scheme so the AUC column is internally
+# comparable; re-integrating the previous 0.05 curves at 0.1 moved AUC by
+# <= 0.002, and it halves the exact-f_dist cost, which dominates everything.
+# experiment.seed is overridden per job by the FDIST_SEED env var.
+# warm_start is OFF so the f_dist family is tested over the full 0->100%%.
 
+experiment:
+  seed: 0
 paths:
-  pretrained_model_path: models/smoke_SimpleViT_cifar10.pth
+  pretrained_model_path: null
   # Root the torchvision datasets live under; hpc/prep_data.sh stages into it.
   dataset_path: data
   model_save_path: models/
   # Per-stage logs from run_experiment.sh are tee'd here; null disables them.
   log_path: logs
-  results_dir: results_smoke
+  results_dir: results
 dataset:
-  name: cifar10
+  name: mnist
 model:
   common:
     model_type: transformer
@@ -37,17 +43,17 @@ training:
   nn:
     num_epochs: 50
   transformer:
-    num_epochs: 2
+    num_epochs: 50
     learning_rate: 0.0005
     optimizer: adamw
     weight_decay: 0.05
-    warmup_epochs: 1
+    warmup_epochs: 5
     label_smoothing: 0.1
     grad_clip: 1.0
 pruning:
   enable_pruning: true
   pruning_scheme: magnitude
-  fim_subset_size: 256
+  fim_subset_size: 500
   fim_subset_seed: 42
   fim_subset_shuffle: true
   fim_calculate_method: backprop
@@ -56,11 +62,17 @@ pruning:
   sweep:
     start: 0.0
     end: 1.0
-    step: 0.5
+    step: 0.1
   f_dist_avg_points: 3
   warm_start:
     enabled: false
     ratio: 0.8
+  f_dist_fast: true
+  f_dist_probe_batch: 32
+  # Probe worker processes for exact f_dist. 1 = serial; the par128 job sets
+  # FDIST_WORKERS=<cores>, which overrides this. Sharding is by coordinate and
+  # is bit-identical to serial (tests/test_fisher_sharding_equivalence.py).
+  f_dist_workers: 1
 evaluation:
   # Which metrics are evaluated at every sweep point and written to the results
   # JSON. All four is what the paper runs. They share one forward pass over the

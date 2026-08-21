@@ -5,8 +5,9 @@ import yaml
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from .utils.data_loader import build_dataloaders
+from .utils.data_loader import build_dataloaders, split_train_val
 from .utils.model_builder import build_model_from_config, get_model_type, resolve_checkpoint_path
+from .utils.seeding import resolve_seed, seed_everything
 
 
 # load config from yaml
@@ -145,8 +146,22 @@ def train_model(config, device):
     """
     model_type = get_model_type(config)
 
+    # Seed BEFORE the dataloaders and the model are built: the seed has to cover
+    # parameter init, the shuffle order and dropout for the +/- std over seeds to
+    # mean anything. No-op when no seed is configured (opt-in; see utils/seeding).
+    seed = resolve_seed(config)
+    if seed is not None:
+        seed_everything(seed)
+        print(f"seed: {seed}")
+
     # augmentation is train-split-only and currently applies to CIFAR-10
     dataset_name, train_loader, test_loader = build_dataloaders(config, augment=True)
+
+    # evaluation.validation_split holds out part of the TRAIN split to watch for
+    # overfitting without touching the test set. 0 (the default, and what the
+    # paper runs) trains on the full split and skips validation entirely.
+    val_split = float((config.get("evaluation", {}) or {}).get("validation_split") or 0.0)
+    train_loader, val_loader = split_train_val(config, train_loader, val_split, seed=seed)
     model, arch_name = build_model_from_config(config, dataset_name=dataset_name)
     model = model.to(device)
 
@@ -177,6 +192,10 @@ def train_model(config, device):
     print(f"Dataset: {dataset_name}")
     print(f"Model: {arch_name} ({n_params:,} params)")
     print(f"Batch size: {batch_size}")
+    if val_loader is not None:
+        n_val, n_train = len(val_loader.dataset), len(train_loader.dataset)
+        print(f"Validation split: {val_split:.3g} "
+              f"({n_val:,} held out, {n_train:,} used for training)")
     print(f"Learning rate: {learning_rate}")
     print(f"Optimizer: {tr_cfg.get('optimizer', 'adam')}"
           + (f" | warmup {warmup_epochs} ep + cosine" if scheduler is not None else "")
@@ -189,7 +208,11 @@ def train_model(config, device):
             model, train_loader, criterion, optimizer, device,
             scheduler=scheduler, grad_clip=grad_clip,
         )
-        print(f"Epoch [{epoch+1}/{num_epochs}] - Loss: {train_loss:.4f}, Accuracy: {train_acc:.2f}%")
+        line = f"Epoch [{epoch+1}/{num_epochs}] - Loss: {train_loss:.4f}, Accuracy: {train_acc:.2f}%"
+        if val_loader is not None:
+            val_loss, val_acc = evaluate(model, val_loader, criterion, device)
+            line += f" | Val Loss: {val_loss:.4f}, Val Accuracy: {val_acc:.2f}%"
+        print(line)
 
     print("-" * 50)
     print("Training completed.")
@@ -200,7 +223,7 @@ def train_model(config, device):
 
 
     # Save model where run_pruning.py will look for it
-    save_file = resolve_checkpoint_path(config, arch_name, dataset_name)
+    save_file = resolve_checkpoint_path(config, arch_name, dataset_name, seed=resolve_seed(config))
     os.makedirs(os.path.dirname(save_file) or ".", exist_ok=True)
     torch.save(model.state_dict(), save_file)
     print(f"Model saved to: {save_file}")

@@ -13,7 +13,9 @@ Code for implementation of the novel Fisher-distance pruning scheme, with its ap
 
 ## Usage
 
-1. Configure the parameters in the `config/config.yaml`, `config/datasets.yaml`, `config/models.yaml`, and `config/pruning.yaml` files according to your needs.
+1. Configure the parameters in `src/config.yaml`, or start from one of the
+   ready-made experiment configs in `configs/` (`nn_mnist`, `nn_cifar10`,
+   `vit_mnist`, `vit_cifar10`) and point `BASE_CONFIG` at it.
 
 2. Run the `train_model` script to start training a new model:
    ```
@@ -27,6 +29,15 @@ Code for implementation of the novel Fisher-distance pruning scheme, with its ap
 
    Alternatively, `./try-script.sh` trains the configured model if its checkpoint is
    missing and then runs every pruning scheme in sequence.
+
+4. Turn the per-run JSONs into the results tables (accuracy and MCC) and the
+   plotting data:
+   ```
+   python -m src.aggregate_results --out paper_tables.md
+   python -m src.aggregate_results --format json --out results.json
+   ```
+   See [EVALUATION_GUIDE.md](EVALUATION_GUIDE.md) for what is recorded and how it
+   is aggregated.
 
 ## Architectures & Datasets
 
@@ -53,8 +64,9 @@ Transformer notes:
 - By default LayerNorm parameters and the positional embedding are excluded from
   pruning (`pruning.prunable_exclude`, standard practice in transformer sparsity
   work); reported pruning ratios remain fractions of ALL parameters.
-- The exact per-coordinate `f_dist` scheme is computationally infeasible at
-  transformer scale; `f_dist_global` is the path-averaged scheme to use there.
+- Exact per-coordinate `f_dist` is affordable at transformer scale via the
+  forward-mode Fisher kernel and process-level probe sharding; `f_dist_global`
+  remains the cheap path-averaged alternative. See [hpc/README.md](hpc/README.md).
 
 ## Pruning Schemes
 
@@ -64,13 +76,23 @@ The project implements the following pruning schemes:
 - **FIM Pruning** (`fim`): Utilizes the Fisher Information Matrix for pruning.
 - **Magnitude x FIM Pruning (One Shot)** (`f_dist_one_shot`): Combines magnitude and FIM pruning in a single pass.
 - **Magnitude x FIM Pruning (Iterative)** (`f_dist_iterative`): Applies magnitude and FIM pruning iteratively.
-- **Square Root of Averaged Magnitude x FIM** (`f_dist`): Uses the square root of the averaged values for pruning (exact per-coordinate path average; feasible only for the NN on MNIST-sized data, ~55k params).
+- **Square Root of Averaged Magnitude x FIM** (`f_dist`): Uses the square root of the averaged values for pruning (exact per-coordinate path average). Its cost is `(K−1)` Fisher probes per surviving coordinate per step; the forward-mode kernel and probe sharding bring that within reach at both scales.
 - **Fisher-distance, global path** (`f_dist_global`): batched α-scan — evaluates the
   Fisher diagonal at K models `α·θ` (all weights shrunk together) and scores
   `|w|·mean_α √F_ii(αθ)`; K Fisher evaluations per pruning step instead of
   #weights×(K−1), making full-range path-averaged sweeps feasible at any scale.
 
-**Magnitude warm-start** (`pruning.warm_start`, on by default): the f_dist family can
+### Development knobs
+
+`evaluation.metrics`, `evaluation.validation_split`, `paths.dataset_path` and
+`paths.log_path` are all live settings, shipped at the values the paper runs on
+(all four metrics, no validation split, `data/`, `logs/`) so the defaults
+reproduce the published numbers. See
+[EVALUATION_GUIDE.md](EVALUATION_GUIDE.md#development-knobs) for what each one
+changes.
+
+**Magnitude warm-start** (`pruning.warm_start`, on in `src/config.yaml`, off in every
+`configs/*.yaml` paper config): the f_dist family can
 be started by cheap magnitude pruning up to `ratio` (default 0.8) and only run the
 Fisher-based scheme for the high-sparsity tail, while still producing the full
 0→100% curve — this keeps exact `f_dist` within HPC walltimes. Set `enabled: false`

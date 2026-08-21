@@ -3,12 +3,12 @@ import torch
 import matplotlib.pyplot as plt
 from sklearn.metrics import matthews_corrcoef, precision_score, f1_score
 from scipy.stats import ttest_rel
-import copy
 import os
 
 
 @torch.no_grad()
-def _collect_preds_and_labels(model, dataloader, device="cpu"):
+def collect_predictions(model, dataloader, device="cpu"):
+    """Argmax predictions and labels over the whole loader, as numpy arrays."""
     model.eval()
     all_preds = []
     all_labels = []
@@ -24,21 +24,68 @@ def _collect_preds_and_labels(model, dataloader, device="cpu"):
     return all_preds, all_labels
 
 
-def evaluate_accuracy(model, dataloader, device="cpu"):
-    preds, labels = _collect_preds_and_labels(model, dataloader, device)
+# Every metric below is a pure reduction of the SAME (preds, labels) pair, which
+# is what lets evaluate_metrics() serve all of them from one forward pass.
+def _accuracy(preds, labels):
     return float((preds == labels).mean())
 
-def evaluate_precision(model, dataloader, device="cpu", average="macro"):
-    preds, labels = _collect_preds_and_labels(model, dataloader, device)
+
+def _precision(preds, labels, average="macro"):
     return float(precision_score(labels, preds, average=average, zero_division=0))
 
-def evaluate_f1(model, dataloader, device="cpu", average="macro"):
-    preds, labels = _collect_preds_and_labels(model, dataloader, device)
+
+def _f1(preds, labels, average="macro"):
     return float(f1_score(labels, preds, average=average, zero_division=0))
 
-def evaluate_mcc(model, dataloader, device="cpu"):
-    preds, labels = _collect_preds_and_labels(model, dataloader, device)
+
+def _mcc(preds, labels):
     return float(matthews_corrcoef(labels, preds))
+
+
+METRIC_FNS = {
+    "accuracy": _accuracy,
+    "precision": _precision,
+    "f1": _f1,
+    "mcc": _mcc,
+}
+
+
+def evaluate_metrics(model, dataloader, names=None, device="cpu"):
+    """
+    Evaluate several metrics from a SINGLE pass over `dataloader`.
+
+    The metrics differ only in how they reduce the same argmax predictions, so
+    evaluating four of them separately costs four identical forward passes over
+    the test set. During a pruning sweep that is the dominant cost of every step
+    for the cheap schemes. Values are identical to the single-metric helpers.
+
+    Returns {name: value}, ordered as `names` (default: all of them).
+    """
+    names = list(METRIC_FNS) if names is None else list(names)
+    unknown = [n for n in names if n not in METRIC_FNS]
+    if unknown:
+        raise ValueError(
+            f"Unknown metric(s): {', '.join(map(str, unknown))}. "
+            f"Supported: {', '.join(METRIC_FNS)}."
+        )
+    preds, labels = collect_predictions(model, dataloader, device)
+    return {n: METRIC_FNS[n](preds, labels) for n in names}
+
+
+def evaluate_accuracy(model, dataloader, device="cpu"):
+    return _accuracy(*collect_predictions(model, dataloader, device))
+
+
+def evaluate_precision(model, dataloader, device="cpu", average="macro"):
+    return _precision(*collect_predictions(model, dataloader, device), average=average)
+
+
+def evaluate_f1(model, dataloader, device="cpu", average="macro"):
+    return _f1(*collect_predictions(model, dataloader, device), average=average)
+
+
+def evaluate_mcc(model, dataloader, device="cpu"):
+    return _mcc(*collect_predictions(model, dataloader, device))
 
 
 
@@ -94,19 +141,19 @@ def plot_accuracy_comparison(prune_pcts, results_dict, title="Accuracy vs. Pruni
         ylim: Y-axis limits tuple (optional)
     """
     plt.figure(figsize=(12, 7))
-    
+
     colors = ['skyblue', 'orange', 'green', 'purple', 'red']
     markers = ['o', 'x', 's', '^', 'D']
     linestyles = ['-', '--', '-.', ':', '--']
-    
+
     for idx, (method_name, accuracies) in enumerate(results_dict.items()):
         color = colors[idx % len(colors)]
         marker = markers[idx % len(markers)]
         linestyle = linestyles[idx % len(linestyles)]
-        
-        plt.plot(prune_pcts, accuracies, marker=marker, linestyle=linestyle, 
+
+        plt.plot(prune_pcts, accuracies, marker=marker, linestyle=linestyle,
                 color=color, label=method_name)
-    
+
     plt.title(title)
     plt.xlabel("Fraction of Weights Pruned Globally")
     plt.ylabel("Test Accuracy")
@@ -121,7 +168,7 @@ def plot_accuracy_comparison(prune_pcts, results_dict, title="Accuracy vs. Pruni
     plt.grid(True)
     plt.legend()
     plt.tight_layout()
-    
+
     if save_path:
         plt.savefig(save_path, dpi=300, bbox_inches='tight')
     plt.show()
@@ -131,19 +178,19 @@ def plot_model_size_comparison(prune_pcts, results_dict, title="Model Size vs. P
                                save_path=None):
     """Plot model size curves for multiple pruning methods"""
     plt.figure(figsize=(12, 7))
-    
+
     colors = ['skyblue', 'orange', 'green', 'purple', 'red']
     markers = ['o', 'x', 's', '^', 'D']
     linestyles = ['-', '--', '-.', ':', '--']
-    
+
     for idx, (method_name, sizes) in enumerate(results_dict.items()):
         color = colors[idx % len(colors)]
         marker = markers[idx % len(markers)]
         linestyle = linestyles[idx % len(linestyles)]
-        
+
         plt.plot(prune_pcts, sizes, marker=marker, linestyle=linestyle,
                 color=color, label=method_name)
-    
+
     plt.title(title)
     plt.xlabel("Fraction of Weights Pruned Globally")
     plt.ylabel("Model Size (KB)")
@@ -151,7 +198,7 @@ def plot_model_size_comparison(prune_pcts, results_dict, title="Model Size vs. P
     plt.grid(True)
     plt.legend()
     plt.tight_layout()
-    
+
     if save_path:
         plt.savefig(save_path, dpi=300, bbox_inches='tight')
     plt.show()
@@ -168,26 +215,26 @@ def plot_metric_curves(all_metrics, metric_name, prune_pcts, save_path=None):
         save_path: Path to save figure (optional)
     """
     plt.figure(figsize=(10, 6))
-    
+
     colors = ['skyblue', 'orange', 'green', 'purple', 'red']
-    
+
     for idx, (scheme, curves) in enumerate(all_metrics.items()):
         curves = np.array(curves)
         mean_curve = np.mean(curves, axis=0)
         std_curve = np.std(curves, axis=0)
         color = colors[idx % len(colors)]
-        
+
         plt.plot(prune_pcts, mean_curve, label=f"{scheme} (mean)", color=color)
-        plt.fill_between(prune_pcts, mean_curve - std_curve, mean_curve + std_curve, 
+        plt.fill_between(prune_pcts, mean_curve - std_curve, mean_curve + std_curve,
                         alpha=0.2, color=color)
-    
+
     plt.xlabel("Fraction of Weights Pruned")
     plt.ylabel(metric_name)
     plt.title(f"{metric_name} vs. Pruning Fraction (Mean ± Std, Cross-Validation)")
     plt.legend()
     plt.grid(True)
     plt.tight_layout()
-    
+
     if save_path:
         plt.savefig(save_path, dpi=300, bbox_inches='tight')
     plt.show()
@@ -205,17 +252,17 @@ def plot_auc_comparison(all_aucs, title="Mean AUC Comparison", save_path=None):
     schemes = list(all_aucs.keys())
     mean_aucs = [np.mean(all_aucs[scheme]) for scheme in schemes]
     std_aucs = [np.std(all_aucs[scheme]) for scheme in schemes]
-    
+
     plt.figure(figsize=(10, 6))
     colors = ['skyblue', 'orange', 'green', 'purple', 'red']
-    plt.bar(schemes, mean_aucs, yerr=std_aucs, capsize=6, 
+    plt.bar(schemes, mean_aucs, yerr=std_aucs, capsize=6,
            color=colors[:len(schemes)])
     plt.ylabel("Mean Normalized AUC")
     plt.title(title)
     plt.xticks(rotation=20, ha='right')
     plt.tight_layout()
     plt.grid(axis='y')
-    
+
     if save_path:
         plt.savefig(save_path, dpi=300, bbox_inches='tight')
     plt.show()
@@ -234,26 +281,26 @@ def statistical_comparison(all_aucs, baseline='magnitude'):
     """
     results = {}
     baseline_aucs = all_aucs.get(baseline)
-    
+
     if baseline_aucs is None:
         print(f"Warning: Baseline method '{baseline}' not found in results")
         return results
-    
+
     print(f"\n{'='*60}")
     print(f"Statistical Comparison (Paired t-tests vs {baseline})")
     print(f"{'='*60}")
-    
+
     for method, aucs in all_aucs.items():
         if method != baseline:
             t_stat, p_val = ttest_rel(baseline_aucs, aucs)
             results[method] = {'t_stat': t_stat, 'p_val': p_val}
             significance = "***" if p_val < 0.001 else "**" if p_val < 0.01 else "*" if p_val < 0.05 else "ns"
             print(f"{baseline} vs {method:30s}: t={t_stat:7.3f}, p={p_val:.4g} {significance}")
-    
+
     print(f"{'='*60}")
     print("Significance: *** p<0.001, ** p<0.01, * p<0.05, ns = not significant")
     print(f"{'='*60}\n")
-    
+
     return results
 
 
@@ -262,19 +309,19 @@ def print_auc_summary(all_aucs):
     print(f"\n{'='*60}")
     print("AUC Summary (Mean ± Std)")
     print(f"{'='*60}")
-    
+
     for scheme, aucs in all_aucs.items():
         mean_auc = np.mean(aucs)
         std_auc = np.std(aucs)
         print(f"{scheme:30s}: {mean_auc:.4f} ± {std_auc:.4f}")
-    
+
     print(f"{'='*60}\n")
 
 
 def save_results_to_file(results_dict, filepath):
     """Save results dictionary to a text file"""
     os.makedirs(os.path.dirname(filepath), exist_ok=True)
-    
+
     with open(filepath, 'w') as f:
         for key, value in results_dict.items():
             f.write(f"{key}:\n")
@@ -284,5 +331,5 @@ def save_results_to_file(results_dict, filepath):
             else:
                 f.write(f"  {value}\n")
             f.write("\n")
-    
+
     print(f"Results saved to {filepath}")

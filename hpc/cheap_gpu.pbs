@@ -1,0 +1,56 @@
+#!/bin/bash
+#PBS -q umagpu
+#PBS -N fdist_cheap
+#PBS -m a
+# so apenas em caso de ABORT: a grade tem ~60 jobs, "abe" geraria centenas de e-mails
+#PBS -k oe
+#PBS -j oe
+# Fila umagpu: 1 A100 (40 GB), 16 nucleos, ate 7 dias, 2 jobs simultaneos/usuario.
+# Recursos alocados automaticamente, entao a linha -l fica comentada.
+# #PBS -l nodes=1:ppn=16
+
+# ---------------------------------------------------------------------------
+# TREINO + TODOS OS ESQUEMAS BARATOS (magnitude, fim, f_dist_one_shot,
+# f_dist_iterative, f_dist_global) para UMA combinacao (config, semente).
+#
+# O f_dist EXATO nao roda aqui -- ele vai para hpc/exact_fdist_par128.pbs, numa
+# fila de CPU grande (ver hpc/README.md para o porque).
+#
+# Submeta a partir da raiz do repo, passando config e semente:
+#   qsub -v CFG=configs/vit_cifar10.yaml,SEED=0 hpc/cheap_gpu.pbs
+# ou use hpc/submit_all.sh, que faz o laco por todas as combinacoes.
+# ---------------------------------------------------------------------------
+
+cd "$PBS_O_WORKDIR" || exit 1
+mkdir -p outputs
+# Se o repo estiver num subdir 'github', descomente:  # cd github || exit 1
+
+: "${CFG:?defina CFG, ex.: -v CFG=configs/vit_cifar10.yaml,SEED=0}"
+: "${SEED:?defina SEED, ex.: -v CFG=configs/vit_cifar10.yaml,SEED=0}"
+
+module load miniconda3/22.11.1-gcc-9.4.0
+source .venv/bin/activate
+
+echo "===== config=$CFG  seed=$SEED  host=$(hostname)  data=$(date) ====="
+nvidia-smi -L 2>/dev/null || echo "AVISO: nvidia-smi indisponivel"
+
+export BASE_CONFIG="$CFG"
+export FDIST_SEED="$SEED"
+export SCHEMES="magnitude fim f_dist_one_shot f_dist_iterative f_dist_global"
+export EXACT_FDIST=no          # o exato roda no job de CPU
+
+chmod +x run_experiment.sh
+./run_experiment.sh
+STATUS=$?
+echo "===== fim (exit $STATUS) ====="
+
+# Movendo a saída gerada no $HOME para o diretório final após o término do job
+JOBNUM="${PBS_JOBID%%.*}"
+LIVE_FILE="$HOME/${PBS_JOBNAME}.o${JOBNUM}"
+if [[ -f "$LIVE_FILE" ]]; then
+    mv "$LIVE_FILE" "$PBS_O_WORKDIR/outputs/"
+else
+    echo "AVISO: arquivo de saída do PBS não encontrado: $LIVE_FILE"
+fi
+
+exit $STATUS

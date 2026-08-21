@@ -1,10 +1,20 @@
+# Repeat-run control. seed covers parameter init, the training shuffle, dropout
+# and the Fisher subset draw; it also namespaces checkpoints and result
+# directories so seeds never collide. null means "do not seed", which reproduces
+# the original single-run behaviour exactly. The HPC jobs override it per job
+# with the FDIST_SEED environment variable.
+experiment:
+  seed: null
+
 paths:
   # null => auto: {model_save_path}/{arch_name}_{dataset}.pth
   # (set an explicit path to reuse an existing checkpoint, e.g. "models/SimpleNN_h2_n64.pth")
   pretrained_model_path: null
-  dataset_path: "data/"
+  # Root the torchvision datasets live under; hpc/prep_data.sh stages into it.
+  dataset_path: "data"
   model_save_path: "models/"
-  log_path: "logs/"
+  # Per-stage logs from run_experiment.sh are tee'd here; null disables them.
+  log_path: "logs"
   # Root for pruning outputs. Each run is written under
   # {results_dir}/{arch}_{dataset}/{scheme}_..._{timestamp}/ so that concurrent
   # jobs for different architectures never overwrite each other's files.
@@ -92,6 +102,16 @@ pruning:
 
   f_dist_avg_points: 3 # K path points: exact f_dist uses alpha in linspace(1,0,K); f_dist_global uses linspace(1,1/K,K)
 
+  # Exact f_dist only. The forward-mode (JVP) fast path returns the identical
+  # averaged Fisher as the original per-coordinate loop (see
+  # tests/test_fdist_fast_equivalence.py) at a fraction of the cost; set false to
+  # fall back to that loop. probe_batch is how many coordinate probes are vmapped
+  # together, workers how many single-threaded processes share the coordinate
+  # list. Both are overridden on the cluster by FDIST_WORKERS / PBS_NP.
+  f_dist_fast: true
+  f_dist_probe_batch: 32
+  f_dist_workers: 1
+
   # Magnitude warm-start for the f_dist family (f_dist, f_dist_iterative,
   # f_dist_global, f_dist_one_shot). When enabled, ratios up to `ratio` are pruned
   # by cheap magnitude pruning and the (expensive) f_dist scheme only runs for the
@@ -104,16 +124,20 @@ pruning:
     ratio: 0.8   # fraction of ALL params magnitude-pruned before f_dist takes over
 
 evaluation:
-  # Basic metrics
+  # Which metrics are evaluated at every sweep point and written to the results
+  # JSON. All four is what the paper runs. They share one forward pass over the
+  # test set, so trimming the list changes what is RECORDED, not the runtime.
+  # 'accuracy' is required -- the plots, the AUC and src/aggregate_results.py are
+  # all keyed on it. Accepted: accuracy, precision, f1, mcc.
   metrics:
     - accuracy
-    - loss
     - precision
-    - f1-score
+    - f1
     - mcc
-  validation_split: 0.2
-
-# Cross-validation settings
+  # Fraction of the TRAIN split held out to report validation loss/accuracy each
+  # epoch. 0 = train on everything, which is what the paper runs; raise it while
+  # developing to watch for overfitting without touching the test set.
+  validation_split: 0.0
 cross_validation:
   num_folds: 1
 

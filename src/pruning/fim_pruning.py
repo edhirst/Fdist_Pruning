@@ -1,14 +1,6 @@
 import torch
-import torch.nn as nn
 
-try:
-    from .base_pruner import BasePruner
-except Exception:
-    # Fallback BasePruner for environments where the relative import is unavailable
-    class BasePruner:
-        """Minimal fallback BasePruner used for linting/tests when the real BasePruner can't be imported."""
-        def __init__(self):
-            pass
+from .base_pruner import BasePruner
 
 from ..utils.fim_calculator import calculate_fim_nngeometry, calculate_fim_backprop
 from .prunable import get_prunable_mask
@@ -53,7 +45,7 @@ class FIMPruner(BasePruner):
                 f"Unknown fim_backend: {self.fim_calculate_method}. "
                 "Supported: 'nngeometry' or 'backprop'."
             )
-            
+
 
     def apply_pruning(self, model, train_loader=None, device='cpu'):
         """
@@ -69,7 +61,7 @@ class FIMPruner(BasePruner):
         """
         if train_loader is None:
             raise ValueError("FIM pruning requires train_loader for FIM computation")
-        
+
         model.to(device)
 
         params = [p for p in model.parameters() if p.requires_grad]
@@ -78,7 +70,7 @@ class FIMPruner(BasePruner):
 
         # Flatten current weights (for active_mask) and compute total once from params
         flat_w = torch.cat([p.data.view(-1) for p in params], dim=0)
-        total = int(flat_w.numel())        
+        total = int(flat_w.numel())
 
         # How many to prune this call (delta fraction of TOTAL)
         k_target = int(round(self.threshold * total))
@@ -89,8 +81,8 @@ class FIMPruner(BasePruner):
 
         # Calculate FIM diagonal
         fim_diag = self._calculate_fim(model, train_loader, device=device).to(flat_w.device)
-        
-        
+
+
         if fim_diag.numel() != total:
             raise ValueError(
                 f"FIM diag length mismatch: fim={fim_diag.numel()} vs params={total}. "

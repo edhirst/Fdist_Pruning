@@ -9,6 +9,18 @@
 # #PBS -l nodes=1:ppn=16
 
 # ---------------------------------------------------------------------------
+# SUPERSEDED -- nao use para a grade do artigo.
+#
+# Este script roda UMA configuracao, SEM semente: o checkpoint e os resultados
+# saem sem sufixo _seed{N}, entao ele nao alimenta a tabela de media +/- desvio.
+# Mantido apenas para um teste rapido de uma arquitetura isolada.
+#
+# Para a grade completa use:   bash hpc/submit_all.sh --go
+#   (hpc/cheap_gpu.pbs + hpc/exact_fdist_par128.pbs, parametrizados por
+#    -v CFG=...,SEED=...[,K=...])
+# ---------------------------------------------------------------------------
+
+# ---------------------------------------------------------------------------
 # SimpleNN (2x64 MLP) on CIFAR-10: treina ate convergir (50 epocas) e roda todos
 # os esquemas de poda 0->100% (magnitude, fim, f_dist_one_shot, f_dist_iterative,
 # f_dist_global; o f_dist exato e' pulado automaticamente no CIFAR). warm_start

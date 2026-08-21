@@ -1,14 +1,6 @@
 import torch
-import torch.nn as nn
 
-try:
-    from .base_pruner import BasePruner
-except Exception:
-    # Fallback BasePruner for environments where the relative import is unavailable
-    class BasePruner:
-        """Minimal fallback BasePruner used for linting/tests when the real BasePruner can't be imported."""
-        def __init__(self):
-            pass
+from .base_pruner import BasePruner
 
 from ..utils.fim_calculator import calculate_fim_nngeometry, calculate_fim_backprop
 from .prunable import get_prunable_mask

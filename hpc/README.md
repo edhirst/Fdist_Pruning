@@ -1,118 +1,211 @@
-# Running on the CENAPAD-SP "Lovelace" cluster (OpenPBS)
+# Running the multi-seed paper grid on CENAPAD-SP "Lovelace" (OpenPBS)
 
-Two self-contained jobs, one per architecture, designed to run **at the same time**
-with **no shared output files**:
+Target: the normalised-AUC tables — one for accuracy, one for MCC — every entry
+mean ± std over 5 seeds, with a compute-time column, for **2 architectures ×
+2 datasets × 6 schemes**.
 
-| Job script | Architecture | Config | Checkpoint | Results directory |
-|---|---|---|---|---|
-| `hpc/nn_cifar10.pbs`  | SimpleNN (2×64 MLP) | `configs/nn_cifar10.yaml`  | `models/SimpleNN_h2_n64_cifar10.pth`        | `results/SimpleNN_h2_n64_cifar10/` |
-| `hpc/vit_cifar10.pbs` | SimpleViT (ViT)     | `configs/vit_cifar10.yaml` | `models/SimpleViT_d4_e128_h4_p4_cifar10.pth` | `results/SimpleViT_d4_e128_h4_p4_cifar10/` |
+| | SimpleNN (2×64 MLP) | SimpleViT (d4/e128/h4/p4) |
+|---|---|---|
+| MNIST | `configs/nn_mnist.yaml` (55,050 par.) | `configs/vit_mnist.yaml` (539,914 par.) |
+| CIFAR-10 | `configs/nn_cifar10.yaml` (201,482 par.) | `configs/vit_cifar10.yaml` (545,930 par.) |
 
-Each job selects its experiment with `export BASE_CONFIG=configs/<...>.yaml` and then
-runs `./run_experiment.sh`, which trains the model and runs every pruning scheme over
-0→100%. The `.pbs` files assume the repo is checked out as a directory named `github`
-under the submit directory (they `cd "$PBS_O_WORKDIR"` then `cd github`) — rename that
-line if your clone differs.
+All four use `sweep.step: 0.1`, `f_dist_avg_points: 3`, `fim_subset_size: 500`,
+`warm_start: off`, all four `evaluation.metrics`, and `validation_split: 0`. One config serves all seeds — `FDIST_SEED` overrides
+`experiment.seed`, and each seed gets its own checkpoint
+(`models/{arch}_{dataset}_seed{N}.pth`) and results directory
+(`…_seed{N}/`), so nothing collides.
 
 ## Submit
 
-Run everything **from the repo root** (that's what the `.pbs` scripts assume — they
-`cd "$PBS_O_WORKDIR"` and expect `run_experiment.sh`, `configs/`, `.venv` right there).
-If instead your repo lives in a subdirectory named `github`, uncomment the `cd github`
-line in each script and submit from the parent.
+```bash
+bash hpc/prep_data.sh                # once, on the LOGIN node: stage MNIST + CIFAR
+qsub hpc/smoke_testegpu.pbs          # 30-min sanity check; look for "SMOKE OK"
+
+bash hpc/submit_all.sh               # DRY RUN: prints every qsub it would issue
+bash hpc/submit_all.sh --go          # actually submit
+qstat -u "$USER"
+```
+
+`submit_all.sh` issues up to three phases per (config, seed) — 60 jobs in the
+default grid (20 cheap + 20 exact + 20 K-sweep):
+
+1. **`hpc/cheap_gpu.pbs`** on `umagpu` — trains the checkpoint and runs the five
+   cheap schemes (magnitude, fim, f_dist_one_shot, f_dist_iterative,
+   f_dist_global).
+2. **`hpc/exact_fdist_par128.pbs`** on `par128` — exact `f_dist` only, reusing
+   that checkpoint (`SKIP_TRAIN=true`), chained with `-W depend=afterok:`.
+3. The same script again per `K` value, for the K-sweep table (SimpleNN/MNIST
+   only by default).
+
+That grid produces **140 pruning runs from 60 jobs**: all 6 schemes × 2
+architectures × 2 datasets × 5 seeds (120), plus the K sweep on SimpleNN/MNIST
+(20 more; K=3 is shared with the main table).
+
+Then build the tables and the plotting data:
 
 ```bash
-# 0. one-time, on the LOGIN node (compute nodes have no internet):
-#    stage the dataset + create dirs so the jobs don't race to download.
-bash hpc/prep_data.sh
-
-# 1. SMOKE TEST FIRST (testegpu, ~5 min, 30-min cap): confirms module + venv + GPU +
-#    torch.func Fisher + the full pipeline actually work on the cluster. Isolated
-#    outputs (models/smoke_*, results_smoke/). Check its log for "SMOKE OK".
-qsub hpc/smoke_testegpu.pbs
-
-# 2. once the smoke passes, submit the two real jobs — they run
-#    independently and simultaneously:
-qsub hpc/nn_cifar10.pbs
-qsub hpc/vit_cifar10.pbs
-
-qstat -u "$USER"        # watch the queue
+python -m src.aggregate_results --out paper_tables.md                 # main tables
+python -m src.aggregate_results --format latex --out paper_tables.tex
+python -m src.aggregate_results --by-k --out k_tables.md              # AUC and cost vs K
+python -m src.aggregate_results --format json --out results.json      # for plots
 ```
 
-The scripts load `miniconda3/22.11.1-gcc-9.4.0` and activate the repo's `.venv`
-(`source .venv/bin/activate`) — adjust the module name / activation to your account, and
-create that venv once (torch, torchvision, nngeometry, scikit-learn, scipy, matplotlib,
-pyyaml). The GPU queues allocate resources automatically, so no `-l nodes=...` line is
-needed. Live job output (`-k oe -j oe`) lands in `$HOME/<jobname>.o<jobid>` and is moved
-to `outputs/` when the job finishes.
+Each of those renders **two tables per architecture/dataset**: AUC of normalised
+accuracy, and AUC of normalised MCC. Accuracy is the headline number; MCC is the
+chance-corrected check that a scheme preserves the decision structure instead of
+collapsing onto the majority class. The accuracy tables also carry the
+floor-corrected column `(AUC−floor)/(1−floor)`; the MCC tables do not, because a
+collapsed one-class predictor scores MCC 0, making the correction the identity.
+Precision and F1 are still recorded and exported to JSON, just not tabulated
+(`--metrics acc_norm f1_norm` overrides the pair).
 
-## Why there is no overwriting
+Runs are grouped by (dataset, architecture, scheme, **K**), so a K-sweep run is
+never averaged into the main table's K=3 row, and a repeated seed within a group
+is reported as a loud `!!` warning rather than silently averaged.
 
-Every run writes under a **per-(architecture, dataset) subdirectory**:
+`--format json` writes everything needed to draw figures later without re-reading
+the results tree (`schema: fdist-aggregate-v1`): per group, the `pruning_ratio`
+grid, all four metric curves **per seed** plus their `mean`/`std` across seeds, AUC and
+floor-corrected AUC (per seed, mean, std), and `compute_seconds` (per seed, mean,
+std, device, worker count). Per-seed arrays are kept alongside the summaries so
+error bands, individual traces and significance tests all remain possible.
+
+## Why exact `f_dist` runs on a CPU queue, not a GPU
+
+Two measured reasons.
+
+**The GPU barely helps.** These models are far too small to saturate an A100 —
+the Fisher evaluation is launch-bound. Backing the rate out of a previous run's
+timestamps: 3.1 s per ViT Fisher evaluation on the A100 against 11.5 s on an
+8-core laptop CPU. A 3.7× speedup is not what a GPU queue is for.
+
+**The CPU queues are far bigger.** Per-user concurrent-job caps are the binding
+constraint:
+
+| queue | walltime | resources | max concurrent (user) |
+|---|---|---|---|
+| `umagpu` | 7 d | 1 A100, 16 cores | **2** |
+| `miggpu` | 7 d | ½ A100, 8 cores | 2 |
+| `duasgpus` | 3 d | 2 A100, 32 cores | 1 |
+| **`par128`** | **7 d** | **128 cores, 488 GB** | **6** |
+| `par16` | 10 d | 16 cores | 4 |
+| `serial` | 10 d | 1 core | 10 |
+
+Job arrays (`qsub -J`) are **not documented** for this cluster, which is why
+`submit_all.sh` loops over individual `qsub` calls. The centre's docs confirm
+**OpenPBS** (so `-v VAR=...` and `-W depend=afterok:` are available) and give
+`#PBS -q par128` + `#PBS -l nodes=1:ppn=128` as the par128 form, which is what
+`exact_fdist_par128.pbs` uses. Every `#PBS` directive sits above the first
+executable line, since PBS ignores directives that appear after one. Job names
+are kept to ≤ 9 characters (`ch_vc_s3`, `k17_nm_s0`) so they are safe under any
+PBS `-N` length limit and make readable `$HOME/<name>.o<jobid>` files. The grid
+scripts use `#PBS -m a` (abort only) — `-m abe` across 60 jobs would send ~180
+e-mails; the one-off smoke test keeps `-m abe`.
+
+## The forward-mode fast path
+
+Exact `f_dist` scores each coordinate with `F_ii` evaluated at a singly-perturbed
+parameter vector. The original implementation obtained that one number by
+running a full reverse-mode Fisher (C backward passes per sample over **all** P
+parameters) and discarding the other P−1 entries.
+
+`fisher_entries_forward` (in `src/utils/fim_calculator.py`) uses the identity
 
 ```
-results/{arch}_{dataset}/{scheme}_pruning_result_figure_{timestamp}/
+F_ii = E_x Var_{c ~ p(·|x)} [ ∂logits_c / ∂θ_i ]
 ```
 
-The two architectures have different `{arch}` (`SimpleNN_h2_n64` vs
-`SimpleViT_d4_e128_h4_p4`), so their result trees never intersect — even if both
-jobs run the same scheme in the same second. The same holds for the trained
-**checkpoints** (distinct filenames) and the PBS **job logs**, which are named after
-the distinct job names (`fdist_nn_cifar10.o<jobid>` vs `fdist_vit_cifar10.o<jobid>`)
-and moved into `outputs/` at the end. The two jobs only ever *read* the shared
-`data/CIFAR10`, which is why it is staged once up front.
+so a single JVP per (coordinate, sample) yields that entry for all classes at
+once. Measured speedup per probe, single core, 500 Fisher samples:
 
-> Extra isolation if you want it: set `paths.results_dir` in a config, or export
-> `FDIST_RESULTS_DIR=/scratch/$USER/run_nn` before the job, to send a job's outputs
-> to a completely separate root.
+| | reverse (old) | forward (new) | speedup |
+|---|---|---|---|
+| SimpleNN / MNIST | 0.612 s | 0.007 s | 89× |
+| SimpleNN / CIFAR-10 | 2.046 s | 0.006 s | 325× |
+| SimpleViT / MNIST | 13.05 s | 1.270 s | 10.3× |
+| SimpleViT / CIFAR-10 | 15.13 s | 1.700 s | 8.9× |
 
-## Walltime — is exact `f_dist` the problem?
+This is exact, not an approximation. `tests/test_fisher_forward_equivalence.py`
+(450 assertions) checks it against the production Fisher on a *literally
+perturbed* model — float64 worst relative error ~1e-15 — and
+`tests/test_fdist_fast_equivalence.py` checks that the pruner built on it selects
+an **identical pruning mask** with bit-exact surviving weights. Set
+`pruning.f_dist_fast: false` to fall back to the original loop.
 
-Short answer: **not for these CIFAR experiments.** On the `umagpu` queue (one full
-A100, up to **7 days** walltime) each job finishes in well under an hour:
+Evaluation at each sweep point is shared the same way: accuracy, precision, F1
+and MCC are reductions of one set of predictions, so `evaluate_metrics` makes a
+single forward pass instead of four. That is ~4× off every sweep point (24.5 s →
+6.0 s for the ViT on CIFAR-10) — negligible next to the Fisher probes for exact
+`f_dist`, but it is most of the cost of the five cheap schemes.
 
-- ViT: ~15–30 min training + ~10–20 min for all pruning sweeps.
-- NN: a few minutes end-to-end.
+## Probe sharding: how the ViT rows become affordable
 
-The only genuinely walltime-hostile scheme is the **exact per-coordinate `f_dist`**,
-which needs ≈ (#active weights) × (K−1) full Fisher evaluations *per pruning step*.
-That is why it is **automatically skipped** for anything larger than the small NN on
-28×28 data — including *both* CIFAR architectures. So it never runs in these jobs,
-and the rest of the schemes (magnitude, fim, f_dist_one_shot, f_dist_iterative,
-f_dist_global) are cheap: `f_dist_global` is only K=3 Fisher evaluations per step.
+A single process cannot use a 128-core node for this. Measured on the real ViT,
+one probe costs ~1.35 s on a core and torch's intra-op threading saturates at
+about 4 threads (1.40 s at 1 thread, 0.89 s at 4, 0.86 s at 8); neither
+`probe_batch` nor `sample_chunk` moves it, and MPS was flat at 0.73 s/probe for
+every `probe_batch`. The work is compute-bound per core with too little internal
+parallelism — which is exactly the profile that shards perfectly across
+*processes*.
 
-Where exact `f_dist` *does* run (NN on MNIST/Fashion-MNIST) and would blow the
-walltime, use the **magnitude warm-start** (next section) to make it tractable.
+`src/utils/fisher_parallel.py` splits the nonzero-coordinate list across
+`FDIST_WORKERS` single-threaded worker processes (one `ProbePool` per pruning
+step, so the model is inherited through the fork rather than pickled per task).
+`hpc/exact_fdist_par128.pbs` sets `FDIST_WORKERS` to the node's core count and
+pins `OMP_NUM_THREADS=1`.
 
-## Magnitude warm-start (`pruning.warm_start`, on by default)
+**This does not change the numbers.** Sharding is by coordinate, never by
+sample, so every coordinate still accumulates over the whole Fisher subset in
+the original batch order; shard boundaries are additionally snapped to
+`probe_batch` multiples so each shard replays the same vmap batch shapes (and
+therefore the same BLAS blocking) the serial path would have used.
+`tests/test_fisher_sharding_equivalence.py` asserts **bit-identical** Fisher
+values, pruning masks, and surviving weights against the serial path at 2/3/4/5/7/8
+workers, on both architectures, in float32 and float64, including a 50%
+pre-pruned model. Measured scaling on this laptop's 4 performance cores: 2.96×
+(~74% efficiency).
 
-To spend the Fisher-evaluation budget only where sparsity is high, the f_dist family
-can be **warm-started by magnitude**: prune 0→`ratio` cheaply by magnitude, then run
-the f_dist scheme only for the `ratio`→1.0 tail. The full 0→100% curve is still
-produced. Configured in any config:
+Cost per seed at Δ=0.1, K=3 (probes = N·(K−1)·(M+1)/2):
 
-```yaml
-pruning:
-  warm_start:
-    enabled: false  # applies to f_dist, f_dist_iterative, f_dist_global, f_dist_one_shot
-    ratio: 0.8      # if enabled: magnitude up to 80% sparsity, then f_dist for 80%->100%
-```
+| | core-days/seed | at 64 eff. cores | at 95 eff. cores |
+|---|---|---|---|
+| SimpleNN / MNIST | 0.05 | minutes | minutes |
+| SimpleNN / CIFAR-10 | 0.17 | minutes | minutes |
+| SimpleViT / MNIST | 86.5 | 1.35 d | 21.9 h |
+| SimpleViT / CIFAR-10 | 117.1 | 1.83 d | 1.23 d |
 
-- The two CIFAR experiment configs (`configs/{nn,vit}_cifar10.yaml`) ship with it
-  **OFF**, so `f_dist_global` and the rest of the f_dist family are tested over the
-  **full 0->100% range** — the project's actual thesis. This is affordable: a
-  full-range `f_dist_global` sweep is ~13 min on a CPU (measured on the 546k-param
-  ViT at 500 Fisher samples) and faster on the A100; `f_dist_iterative` ~4 min.
-- Turn it **on** (`enabled: true`) only to focus the Fisher-evaluation budget on the
-  high-sparsity tail — e.g. to make exact per-coordinate `f_dist` tractable on MNIST.
-  It remains on by default in the base `src/config.yaml`.
+Every run fits the 7-day `par128` walltime with margin even at the pessimistic
+end. Total for the exact-`f_dist` line: **~6,200 UA** (10 ViT runs ≈ 6,108;
+10 NN runs ≈ 6; 20 K-sweep runs ≈ 60). Check your allocation before submitting.
+
+## The K sweep
+
+`K` (`pruning.f_dist_avg_points`) is the number of points in the exact-`f_dist`
+path average, and cost is proportional to `K−1` probes per coordinate. `FDIST_K`
+overrides the config and tags the results directory `_K{n}`, so one config drives
+the whole sweep.
+
+Phase 3 runs `K ∈ {2,5,9,17}` on SimpleNN/MNIST; together with the `K=3` that
+phase 2 already produces, the ladder is **{2, 3, 5, 9, 17}**. That choice is
+deliberate: `linspace(1,0,K)` then gives `{1,0} ⊂ {1,½,0} ⊂ quarters ⊂ eighths ⊂
+sixteenths` — each grid a strict superset of the last, so the sweep is a genuine
+dyadic refinement — while the cost, `K−1` probes per coordinate, doubles exactly
+**1, 2, 4, 8, 16** with no gaps. `K=3` is not rerun: phase 2 produces it on the
+same config, seeds, sweep grid and node type, so it is directly comparable.
+
+Tune with `K_VALUES=...`, `K_CONFIGS=...` (add `configs/nn_cifar10.yaml` for the
+CIFAR NN too), or `K_SWEEP=0` to skip.
 
 ## Notes
 
-- `fim_device` is `auto` in these configs, so Fisher runs on the allocated A100.
-  (The repo default is `cpu`, which is specific to Apple-Silicon MPS where
-  `torch.func` per-sample gradients are slow; CUDA does not have that problem.)
-  If you ever see the FIM sweeps underperform on a node, set `fim_device: cpu`.
-- Lighter queues work too and may schedule faster given how small these models are:
-  swap `-q umagpu` for `-q miggpu` (½ A100, 7 days) or `-q miggpu24h` (½ A100, 1 day).
-- Plot rendering is headless-safe (`matplotlib` uses the Agg backend); no X needed.
+- `fim_device: auto` in all four configs, so the cheap sweeps use the allocated
+  A100. `par128` jobs have no GPU and fall back to CPU automatically.
+- `paths.dataset_path` decides where the datasets are read from and is what
+  `prep_data.sh` stages into, so pointing it at node-local scratch needs no other
+  change. `paths.log_path` is where `run_experiment.sh` tees each stage;
+  `FDIST_LOG_DIR` overrides it per job.
+- Live PBS output (`-k oe -j oe`) lands in `$HOME/<jobname>.o<jobid>` and is
+  moved to `outputs/` when the job ends.
+- Plot rendering is headless-safe (matplotlib Agg); no X needed.
+- `par128` costs 32 UA/hour, i.e. 0.25 UA per core-hour.
+- Job names are unique per (config, seed, K), so nothing collides in `outputs/`.
