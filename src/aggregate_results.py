@@ -59,10 +59,20 @@ METRIC_LABEL = {
 FLOOR_TOL = 1e-9
 
 
-def load_runs(root):
+def load_runs(root, verbose=True):
+    """
+    Every run under `root`, except those archived under a directory named `old`.
+
+    The exclusion matches a path COMPONENT named exactly "old", so `results/old4/`
+    is NOT archived -- nest it as `results/old/old4/` instead. Because a failed
+    archive silently contaminates every table, the counts are reported rather
+    than left for the caller to infer.
+    """
     runs = []
+    excluded = 0
     for path in sorted(glob.glob(os.path.join(root, "**", "*_results.json"), recursive=True)):
-        if f"{os.sep}old{os.sep}" in path:
+        if "old" in os.path.normpath(path).split(os.sep)[:-1]:
+            excluded += 1
             continue
         try:
             with open(path) as fh:
@@ -75,7 +85,12 @@ def load_runs(root):
         d["_path"] = path
         runs.append(d)
     if not runs:
-        raise SystemExit(f"No *_results.json found under {root!r}")
+        raise SystemExit(
+            f"No *_results.json found under {root!r}"
+            + (f" ({excluded} excluded as archived under 'old/')" if excluded else ""))
+    if verbose:
+        note = f" ({excluded} archived under 'old/' excluded)" if excluded else ""
+        print(f"{len(runs)} run(s) loaded from {root!r}{note}\n")
     return runs
 
 
