@@ -87,18 +87,18 @@ build_jobs() {
 # ---- what PBS currently knows -----------------------------------------------
 # qstat rows look like: <jobid> <user> <queue> <jobname> ... <state> <time>
 # Job names are kept to <= 9 chars precisely so they are never truncated here.
-qstat_rows() { qstat -u "$USER" 2>/dev/null | awk '$1 ~ /^[0-9]+\./ {print}'; }
+qstat_rows() { qstat -u "$USER" 2>/dev/null | awk '$1 ~ /^[0-9]+\./ {print}' || true; }
 
 sync_state() {
   local id name
   while read -r id _ _ name _; do
     [[ -z "${name:-}" ]] && continue
-    grep -q "^${name} " "$STATE" 2>/dev/null || echo "${name} ${id}" >> "$STATE"
+    if [[ -z "$(state_id "$name")" ]]; then echo "${name} ${id}" >> "$STATE"; fi
   done < <(qstat_rows)
 }
 
 queue_used() { qstat_rows | awk -v q="$1" '$3 == q' | wc -l | tr -d ' '; }
-state_id()   { grep -m1 "^$1 " "$STATE" 2>/dev/null | awk '{print $2}'; }
+state_id()   { awk -v t="$1" '$1 == t {print $2; exit}' "$STATE" 2>/dev/null; }
 submitted()  { [[ -n "$(state_id "$1")" ]]; }
 in_queue()   { qstat_rows | awk -v i="$1" '$1 == i' | grep -q .; }
 
@@ -168,7 +168,7 @@ case "$MODE" in
       id=$(state_id "$tag")
       if [[ -z "$id" ]]; then printf '%-12s %-12s %s\n' "$tag" "-" "not submitted"
       elif in_queue "$id"; then
-        printf '%-12s %-12s %s\n' "$tag" "$id" "$(qstat_rows | awk -v i="$id" '$1==i {print $(NF-1)}')"
+        printf '%-12s %-12s %s\n' "$tag" "$id" "$(qstat_rows | awk -v i="$id" '$1==i {print $(NF-1)}' || true)"
       else printf '%-12s %-12s %s\n' "$tag" "$id" "finished/left queue"; fi
     done < <(build_jobs)
     ;;
