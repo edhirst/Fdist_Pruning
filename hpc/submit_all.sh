@@ -29,6 +29,20 @@
 set -euo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
 
+# cron gives a minimal environment: no USER, and a PATH that usually lacks the
+# scheduler binaries. Without these two lines a cron-driven run silently submits
+# nothing and looks exactly like "the queues are full".
+USER=${USER:-$(id -un)}
+PATH="$PATH:/opt/pbs/bin:/usr/local/bin"
+for tool in qsub qstat; do
+  command -v "$tool" >/dev/null 2>&1 || {
+    echo "ERROR: '$tool' not found on PATH." >&2
+    echo "  PATH=$PATH" >&2
+    echo "  If running from cron, add the directory holding qsub to the PATH line above." >&2
+    exit 127
+  }
+done
+
 SEEDS=${SEEDS:-"0 1 2 3 4"}
 CONFIGS=${CONFIGS:-"configs/nn_mnist.yaml configs/nn_cifar10.yaml configs/vit_mnist.yaml configs/vit_cifar10.yaml"}
 
@@ -164,13 +178,25 @@ case "$MODE" in
     sync_state
     echo "grid: ${total_jobs} jobs   state file: ${STATE}"
     printf '%-12s %-12s %s\n' TAG JOBID STATE
+    n_wait=0; n_run=0; n_done=0; n_todo=0
     while IFS='|' read -r tag _ _ _ _; do
       id=$(state_id "$tag")
-      if [[ -z "$id" ]]; then printf '%-12s %-12s %s\n' "$tag" "-" "not submitted"
+      if [[ -z "$id" ]]; then
+        printf '%-12s %-12s %s\n' "$tag" "-" "not submitted"; n_todo=$((n_todo + 1))
       elif in_queue "$id"; then
-        printf '%-12s %-12s %s\n' "$tag" "$id" "$(qstat_rows | awk -v i="$id" '$1==i {print $(NF-1)}' || true)"
-      else printf '%-12s %-12s %s\n' "$tag" "$id" "finished/left queue"; fi
+        st=$(qstat_rows | awk -v i="$id" '$1==i {print $(NF-1)}' || true)
+        printf '%-12s %-12s %s\n' "$tag" "$id" "$st"
+        case "$st" in R) n_run=$((n_run + 1)) ;; *) n_wait=$((n_wait + 1)) ;; esac
+      else
+        printf '%-12s %-12s %s\n' "$tag" "$id" "finished/left queue"; n_done=$((n_done + 1))
+      fi
     done < <(build_jobs)
+    echo
+    echo "  finished ${n_done} | running ${n_run} | queued/held ${n_wait} | not submitted ${n_todo}" \
+         "  (of ${total_jobs})"
+    # "finished" only means the job left the queue -- a crashed job looks the
+    # same here. The results tree is the authority on what actually completed.
+    echo "  results on disk: $(find results -name '*_results.json' -not -path '*/old/*' 2>/dev/null | wc -l | tr -d ' ') of 140 runs"
     ;;
   dry)
     echo "grid: ${total_jobs} jobs (caps: umagpu ${CAP_UMAGPU}, par128 ${CAP_PAR128})"
