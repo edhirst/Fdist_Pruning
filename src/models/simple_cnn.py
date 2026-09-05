@@ -1,3 +1,10 @@
+"""
+SimpleCNN: a small convolutional classifier.
+
+Selected by `model.common.model_type: "cnn"`. Not used in the paper, which
+compares SimpleNN against SimpleViT; kept as a third architecture the pruning
+schemes can be run against.
+"""
 import torch.nn as nn
 import torch.nn.functional as F
 

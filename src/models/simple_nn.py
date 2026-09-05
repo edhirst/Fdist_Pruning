@@ -1,3 +1,11 @@
+"""
+SimpleNN: a plain fully-connected classifier.
+
+Flattens the image and passes it through `hidden_layers` ReLU layers of width
+`hidden_size` to `num_classes` logits. The input dimension is set by the
+dataset (784 for 28x28 greyscale, 3072 for 32x32 colour), so the same
+configuration gives 55,050 parameters on MNIST and 201,482 on CIFAR-10.
+"""
 import torch.nn as nn
 
 class SimpleNN(nn.Module):

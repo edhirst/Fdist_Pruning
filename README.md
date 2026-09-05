@@ -1,112 +1,172 @@
-# Fdist_NNPruning
-Code for implementation of the novel Fisher-distance pruning scheme, with its application to Neural Networks and Transformers.
+# Fisher-Distance Pruning
+
+Reference implementation for **Fisher Information Distance Pruning for Neural
+Architectures** (Berman, Fu, Hirst, Obirai).
+
+Pruning a weight is a *finite* move in model space, from its trained value to
+zero. Model space carries a natural metric, the Fisher information, so that move
+has a length. Taking that length as the importance score gives
+
+```
+s_k  =  sqrt( (1/K) * sum_alpha  I_kk( theta | theta^k -> alpha*theta^k ) )  *  |theta^k|
+```
+
+where `alpha` runs over `K` points from 1 to 0 along the coordinate line. Holding
+the metric constant collapses this to `sqrt(I_kk) * |theta^k|`, which is exactly
+magnitude pruning multiplied by Fisher pruning: the two standard criteria fall
+out as the leading term of one geometric quantity, rather than being combined by
+hand. The rest of the family refines how faithfully the metric is resolved along
+the path.
 
 ## Installation
 
-1. Clone the repository:
-   ```
-   git clone <repository-url>
-   ```
-   ...the `cd` into it locally.
+```bash
+git clone <repository-url> && cd Fdist_NNPruning
+uv venv && source .venv/bin/activate
+uv pip install -r environment/requirements.txt
+```
 
-2. Follow the instructions in the `environment` folder to set up the venv.
+See [environment/README.md](environment/README.md) for alternatives to `uv`.
 
-## Usage
+## Quick start
 
-1. Configure the parameters in `src/config.yaml`, or start from one of the
-   ready-made experiment configs in `configs/` (`nn_mnist`, `nn_cifar10`,
-   `vit_mnist`, `vit_cifar10`) and point `BASE_CONFIG` at it.
+```bash
+./try-script.sh                      # train (if needed), then every scheme, on src/config.yaml
+./try-script.sh configs/nn_mnist.yaml
+```
 
-2. Run the `train_model` script to start training a new model:
-   ```
-   python -m src.train_model
-   ```
+Or drive the two stages directly:
 
-3. Run the `run_pruning` script to start pruning the model:
-   ```
-   python -m src.run_pruning
-   ```
+```bash
+python -m src.train_model            # writes models/{arch}_{dataset}.pth
+python -m src.run_pruning            # sweeps 0 -> 100% sparsity, writes results/
+```
 
-   Alternatively, `./try-script.sh` trains the configured model if its checkpoint is
-   missing and then runs every pruning scheme in sequence.
+Both read `src/config.yaml`; `model.common.model_type` (`nn` | `cnn` |
+`transformer`) picks the architecture and `dataset.name` (`mnist` |
+`fashion_mnist` | `cifar10`) the dataset. Any combination works, input shapes are
+handled automatically, and checkpoints and results are namespaced per
+architecture, dataset and seed so concurrent runs never collide.
 
-4. Turn the per-run JSONs into the results tables (accuracy and MCC) and the
-   plotting data:
-   ```
-   python -m src.aggregate_results --out paper_tables.md
-   python -m src.aggregate_results --format json --out results.json
-   ```
-   See [EVALUATION_GUIDE.md](EVALUATION_GUIDE.md) for what is recorded and how it
-   is aggregated.
+## Pruning schemes
 
-## Architectures & Datasets
+`pruning.pruning_scheme` selects one of six. The first two are the baselines; the
+rest are the Fisher-distance family, in increasing order of how carefully they
+resolve the metric along the pruning path.
 
-`model.common.model_type` in `src/config.yaml` selects the architecture and
-`dataset.name` the dataset (`mnist`, `fashion_mnist`, `cifar10` — `cifar` is
-accepted as an alias). Any combination works; input shapes are handled
-automatically, and checkpoints are stored per combination as
-`models/{arch}_{dataset}.pth`. **The default for both architectures is CIFAR-10**,
-so the two testbeds are directly comparable on the same task (and CIFAR-10
-degrades gradually under pruning, letting schemes separate over the whole
-0–100% range, whereas MNIST curves stay flat until ~70% sparsity).
+| `pruning_scheme` | Score for weight `k` | Fisher work per sweep point |
+|---|---|---|
+| `magnitude` | `\|theta^k\|` | none |
+| `fim` | `I_kk(theta)` | 1 evaluation |
+| `f_dist_one_shot` | `sqrt(I_kk(theta*)) * \|theta^k\|` | 1 evaluation, always at the dense point `theta*` |
+| `f_dist_iterative` | `sqrt(I_kk(theta)) * \|theta^k\|` | 1 evaluation, at the current pruned model |
+| `f_dist_global` | `\|theta^k\| * mean_alpha sqrt(I_kk(alpha*theta))` | `K` evaluations |
+| `f_dist` | `sqrt( mean_alpha I_kk(theta\|theta^k -> alpha*theta^k) ) * \|theta^k\|` | 1 evaluation + `K-1` probes **per surviving weight** |
 
-- **`nn`** — `SimpleNN` MLP (input→64→64→10; images are flattened, so 784 inputs
-  / ~55k params on MNIST-sized data and 3072 inputs / ~201k params on CIFAR-10).
-- **`transformer`** — `SimpleViT`, a compact ViT-Lite-style Vision Transformer
-  (conv patchify, learned positional embedding, pre-LN blocks with explicit
-  softmax attention, mean pooling; ~546k params at the default
-  patch 4 / dim 128 / depth 4 / 4 heads) trained from scratch on the
-  standard compact-ViT benchmark, CIFAR-10.
+`magnitude`, `fim` and `f_dist_one_shot` re-prune from a fresh copy of the dense
+model at every sweep point, so zeros never accumulate ambiguously; the other
+three advance one running model by `sweep.step` and recompute the metric on the
+current pruned state.
 
-Transformer notes:
-- Fisher must use `fim_calculate_method: "backprop"` (nngeometry's KFAC has no
-  LayerNorm/attention support).
-- By default LayerNorm parameters and the positional embedding are excluded from
-  pruning (`pruning.prunable_exclude`, standard practice in transformer sparsity
-  work); reported pruning ratios remain fractions of ALL parameters.
-- Exact per-coordinate `f_dist` is affordable at transformer scale via the
-  forward-mode Fisher kernel and process-level probe sharding; `f_dist_global`
-  remains the cheap path-averaged alternative. See [hpc/README.md](hpc/README.md).
+`f_dist` is the exact per-coordinate measure the others approximate, and the
+reason it is normally considered impractical: it perturbs one coordinate at a
+time, so cost scales with the parameter count. Two things bring it within reach
+even for the ~546k-parameter ViT:
 
-## Pruning Schemes
+- a **forward-mode (JVP) Fisher kernel** using
+  `I_ii = E_x Var_{c~p(.|x)}[d logits_c / d theta_i]`, which reads one diagonal
+  entry per forward-mode pass instead of running `C` backward passes over all
+  parameters to keep one number (8.9x to 325x per probe, and exact, not
+  approximate);
+- **process-level probe sharding** across cores, bit-identical to the serial path.
 
-The project implements the following pruning schemes:
+`f_dist_global` is the cheap alternative: it shrinks all weights together along
+the ray `alpha*theta` and reads every diagonal entry from each evaluation, so
+cost is `K` Fisher evaluations per step regardless of model size.
 
-- **Magnitude Pruning** (`magnitude`): Removes weights based on their magnitude.
-- **FIM Pruning** (`fim`): Utilizes the Fisher Information Matrix for pruning.
-- **Magnitude x FIM Pruning (One Shot)** (`f_dist_one_shot`): Combines magnitude and FIM pruning in a single pass.
-- **Magnitude x FIM Pruning (Iterative)** (`f_dist_iterative`): Applies magnitude and FIM pruning iteratively.
-- **Square Root of Averaged Magnitude x FIM** (`f_dist`): Uses the square root of the averaged values for pruning (exact per-coordinate path average). Its cost is `(K−1)` Fisher probes per surviving coordinate per step; the forward-mode kernel and probe sharding bring that within reach at both scales.
-- **Fisher-distance, global path** (`f_dist_global`): batched α-scan — evaluates the
-  Fisher diagonal at K models `α·θ` (all weights shrunk together) and scores
-  `|w|·mean_α √F_ii(αθ)`; K Fisher evaluations per pruning step instead of
-  #weights×(K−1), making full-range path-averaged sweeps feasible at any scale.
+## Reproducing the paper
 
-### Development knobs
+The four paper testbeds are the ready-made configs, each pinned to the published
+settings (`sweep.step: 0.1`, `f_dist_avg_points: 3`, `fim_subset_size: 500`,
+warm-start off, all four metrics, no validation split):
 
-`evaluation.metrics`, `evaluation.validation_split`, `paths.dataset_path` and
-`paths.log_path` are all live settings, shipped at the values the paper runs on
-(all four metrics, no validation split, `data/`, `logs/`) so the defaults
-reproduce the published numbers. See
-[EVALUATION_GUIDE.md](EVALUATION_GUIDE.md#development-knobs) for what each one
-changes.
+| | SimpleNN (2x64 MLP) | SimpleViT (d4/e128/h4/p4) |
+|---|---|---|
+| MNIST | `configs/nn_mnist.yaml` (55,050 par.) | `configs/vit_mnist.yaml` (539,914 par.) |
+| CIFAR-10 | `configs/nn_cifar10.yaml` (201,482 par.) | `configs/vit_cifar10.yaml` (545,930 par.) |
 
-**Magnitude warm-start** (`pruning.warm_start`, on in `src/config.yaml`, off in every
-`configs/*.yaml` paper config): the f_dist family can
-be started by cheap magnitude pruning up to `ratio` (default 0.8) and only run the
-Fisher-based scheme for the high-sparsity tail, while still producing the full
-0→100% curve — this keeps exact `f_dist` within HPC walltimes. Set `enabled: false`
-for the full-range comparison.
+The full grid is 6 schemes x 2 architectures x 2 datasets x 5 seeds, plus a
+K-ladder, and is submitted as 60 PBS jobs producing 140 runs. See
+[hpc/README.md](hpc/README.md) for the cluster recipe, walltimes and the
+verification checks.
 
-Result JSONs additionally contain per-metric AUC of the normalized sparsity–accuracy curves.
-Each run is written to `{paths.results_dir}/{arch}_{dataset}/{scheme}_..._{timestamp}/`
-(override the root with `FDIST_RESULTS_DIR`), so concurrent runs never collide. For
-running the two architectures as parallel HPC jobs, see [hpc/README.md](hpc/README.md).
+Then aggregate the per-run JSONs and regenerate the paper's tables and figures:
+
+```bash
+python -m src.aggregate_results --root results --format json --out paper_data.json
+python -m src.make_paper_tables > tables.tex
+python -m src.make_paper_figures --out figures/          # PDFs + PNGs
+```
+
+Both generators read only `paper_data.json`, so a number can never drift between
+a figure, a table and the prose. `make_paper_figures` writes to `../overleaf/figures`
+by default, which assumes the paper source sits alongside this repository; pass
+`--out` for anywhere else. `aggregate_results` also renders markdown or
+LaTeX tables directly (`--format markdown`, `--by-k` for the K-ladder); see
+[EVALUATION_GUIDE.md](EVALUATION_GUIDE.md) for what each run records and how it
+is aggregated.
+
+## Repository layout
+
+```
+src/
+  train_model.py            training loop, per-architecture recipes
+  run_pruning.py            the sparsity sweep; scheme dispatch and logging
+  aggregate_results.py      per-run JSONs -> multi-seed tables (markdown/LaTeX/JSON)
+  make_paper_tables.py      paper_data.json -> overleaf/tables.tex
+  make_paper_figures.py     paper_data.json -> overleaf/figures/
+  subset_experiment.py      how far the Fisher subset size can be cut (rank correlation)
+  config.yaml               the single source of settings, fully commented
+  models/                   SimpleNN, SimpleCNN, SimpleViT
+  pruning/                  one module per scheme, all subclassing BasePruner
+  utils/                    Fisher calculators, data, metrics, seeding
+configs/                    the four paper testbeds (+ a ViT smoke test)
+hpc/                        PBS job scripts and the grid submitter
+tests/                      equivalence tests for the fast paths
+```
+
+To add a scheme, subclass `BasePruner`, implement `apply_pruning`, and register
+it in `src/pruning/__init__.py` and `build_pruner` in `src/run_pruning.py`
+(details in [EVALUATION_GUIDE.md](EVALUATION_GUIDE.md#adding-a-pruning-scheme)).
+
+## Tests
+
+The optimised Fisher paths are justified by equivalence rather than by
+benchmark, so each has a test asserting it reproduces the reference
+implementation:
+
+```bash
+python -m tests.test_fisher_forward_equivalence    # JVP kernel   == backprop Fisher
+python -m tests.test_fdist_fast_equivalence        # fast f_dist  == per-coordinate loop (same weights pruned)
+python -m tests.test_fisher_sharding_equivalence   # sharded      == serial, bit-identical
+python -m tests.test_single_pass_metrics           # one-pass metrics == per-metric passes
+```
+
+## Citation
+
+```bibtex
+@article{Berman:2026fdist,
+    author  = {Berman, David S. and Fu, Yen-Yu and Hirst, Edward and Obirai, Thelma Chiwete},
+    title   = {{Fisher Information Distance Pruning for Neural Architectures}},
+    year    = {2026}
+}
+```
 
 ## Contributing
 
-Contributions are welcome! Please open an issue or submit a pull request for any improvements or bug fixes.
+Contributions are welcome. Please open an issue or submit a pull request for any
+improvements or bug fixes.
 
 ## License
 
-This project is licensed under the MIT License. See the LICENSE file for details.
+MIT. See [LICENSE](LICENSE).

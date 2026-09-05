@@ -1,3 +1,29 @@
+"""
+Run one pruning scheme over a sparsity sweep and record what it costs.
+
+    python -m src.run_pruning [config.yaml]      # defaults to src/config.yaml
+
+Loads the checkpoint named by the config (or trained by src/train_model.py),
+then walks `pruning.sweep` from `start` to `end` in steps of `step`, pruning to
+each ratio and evaluating every metric in `evaluation.metrics` on the test set.
+`magnitude`, `fim` and `f_dist_one_shot` re-prune a fresh copy of the dense model
+to each absolute ratio; `f_dist_iterative`, `f_dist_global` and `f_dist` advance
+one running model by `step` and recompute the Fisher on the current pruned state
+(see ITERATIVE_SCHEMES below).
+
+Everything for one run lands in
+
+    {FDIST_RESULTS_DIR | paths.results_dir}/{arch}_{dataset}[_seed{N}]/{scheme}_..._{timestamp}/
+
+as `{scheme}_results.json` (per-ratio metrics, their normalised forms, AUCs,
+wall-clock and the resolved config) plus one plot per metric. The timestamp and
+the seed suffix are what let the whole HPC grid run concurrently without
+collisions.
+
+Environment overrides, used by the cluster scripts: FDIST_SEED
+(experiment.seed), FDIST_K (pruning.f_dist_avg_points), FDIST_RESULTS_DIR
+(the output root), FDIST_WORKERS (exact-f_dist probe sharding).
+"""
 import os
 import sys
 import yaml

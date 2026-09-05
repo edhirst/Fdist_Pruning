@@ -7,8 +7,25 @@ from .prunable import get_prunable_mask
 
 class FDistOneShotPruner(BasePruner):
     """
-    One-shot pruning combining magnitude and FIM scores.
-    Combined score = FIM_diagonal * |weight|
+    Fisher-distance pruning, one-shot: score = sqrt(I_kk(theta*)) * |w|.
+
+    The cheapest member of the f_dist family, and the leading term of the
+    distance derivation: the metric is evaluated at the trained point and never
+    re-anchored as the model is pruned. Note the SQUARE ROOT on the Fisher
+    entry, which is what makes the product a length rather than an ad hoc
+    combination of the two baselines.
+
+    run_pruning.py drives this scheme by re-pruning a fresh copy of the dense
+    model to each absolute ratio, so the metric is always the one at theta*.
+
+    Selection runs only over ACTIVE weights (w != 0) intersected with the
+    eligibility mask from prunable.py.
+
+    Parameters (dict) via set_parameters():
+        pruning_threshold: float in [0,1], the fraction of ALL prunable
+            parameters to remove
+        fim_calculate_method: "backprop" or "nngeometry"
+        prunable_exclude: list of groups to protect, see prunable.py
     """
     def __init__(self, parameters=None):
         super().__init__()

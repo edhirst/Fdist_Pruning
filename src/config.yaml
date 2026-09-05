@@ -154,7 +154,11 @@ plots:
 #   full 0-100% range, whereas MNIST curves stay flat until ~70% sparsity)
 # - To reproduce the original NN experiments: model_type: "nn", dataset.name: "mnist",
 #   and set paths.pretrained_model_path: "models/SimpleNN_h2_n64.pth"
-# - Exact f_dist needs ~#active-weights full-FIM evals per step: feasible only for
-#   the NN on mnist/fashion_mnist (~55k params). On cifar10 the NN has ~201k params
-#   (3072 inputs) and the ViT ~546k — use f_dist_global (path-averaged, K evals/step)
-#   there instead; the shell scripts apply this gating automatically
+# - Exact f_dist probes (K-1) coordinates per surviving weight per step, so its cost
+#   scales with the parameter count. The forward-mode Fisher kernel (f_dist_fast,
+#   the default) and process-level probe sharding (f_dist_workers) bring it within
+#   reach at every scale here, including the ~546k-parameter ViT: the paper grid
+#   runs it on all four architecture/dataset cells. It remains the expensive
+#   member of the family by orders of magnitude, so f_dist_global (path-averaged,
+#   K evals/step regardless of model size) is the cheap alternative when the exact
+#   ground truth is not what is wanted

@@ -1,3 +1,11 @@
+"""
+SimpleViT: a compact vision transformer for small images, plus its parts.
+
+Written out with plain nn.Linear layers and an explicit softmax attention rather
+than nn.MultiheadAttention, so that torch.func per-sample gradients work on it
+and every learnable tensor is one the pruners can see. See the class docstrings
+below for why each choice was made.
+"""
 import torch
 import torch.nn as nn
 

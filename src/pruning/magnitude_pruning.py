@@ -7,8 +7,23 @@ from .prunable import get_prunable_mask
 
 class MagnitudePruner(BasePruner):
     """
-    Prunes weights based on their absolute magnitude.
-    Removes weights with the lowest absolute values.
+    Magnitude pruning: score = |w|.
+
+    Prunes the `pruning_threshold` fraction of parameters with the smallest
+    absolute value. This is the standard unstructured baseline, and (by the
+    derivation in the paper) the special case of the Fisher-distance measure
+    obtained by taking the metric to be Euclidean.
+
+    Selection runs only over ACTIVE weights (w != 0) intersected with the
+    eligibility mask from prunable.py, so already-pruned weights cannot be
+    re-selected and excluded groups (LayerNorm, positional embeddings) are never
+    touched.
+
+    Parameters (dict) via set_parameters():
+        pruning_threshold: float in [0,1], the fraction of ALL prunable
+            parameters to remove (clamped to range; a bare float is also
+            accepted for backward compatibility)
+        prunable_exclude: list of groups to protect, see prunable.py
     """
     def __init__(self, threshold=0.0):
         super().__init__()

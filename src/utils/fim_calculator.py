@@ -1,3 +1,33 @@
+"""
+Fisher information diagonals, in three flavours.
+
+Every routine here returns the DIAGONAL only, as a flat CPU tensor in
+`model.named_parameters()` flatten order. The full P x P matrix is never formed
+(see the diagonal approximation in the paper), so the pruners can treat the
+Fisher as an elementwise weight over parameters.
+
+    calculate_fim_backprop        the production path. One pass over the data
+                                  yields the whole diagonal, via per-sample
+                                  gradients of log p(c|x) weighted by p(c|x).
+                                  This is the MODEL Fisher (the expectation is
+                                  over the model's own predictive distribution
+                                  c ~ p(.|x,theta)), not the empirical Fisher.
+
+    calculate_fim_nngeometry      nngeometry's KFAC representation, reduced to
+                                  its diagonal. Linear/Conv2d only, so it raises
+                                  on any model containing a LayerNorm.
+
+    fisher_entries_forward        forward-mode (JVP) SINGLE entries at singly
+                                  perturbed parameter states, for exact f_dist.
+                                  Reading one entry per pass instead of building
+                                  the whole diagonal and discarding all but one
+                                  is what makes the exact scheme affordable; see
+                                  the derivation in its own comment block below.
+
+calculate_fim_backprop_per_tensor is the original, much slower implementation,
+kept as the reference the fast paths are tested against
+(tests/test_fisher_forward_equivalence.py).
+"""
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -44,8 +74,15 @@ def calculate_fim_nngeometry(model, loader, device="cpu"):
 
 def calculate_fim_backprop(model, loader, device="cpu", chunk_size=32):
     """
-    Calculate the class-marginal empirical Fisher diagonal in a SINGLE pass over
+    Calculate the class-marginal MODEL Fisher diagonal in a SINGLE pass over
     the data, for ALL parameter tensors at once:
+
+    The expectation over classes is taken against the model's own predictive
+    distribution p(c|x), NOT against the observed labels, so this is the model
+    Fisher and not the empirical Fisher. The distinction matters: only the former
+    is the Fisher information of the model, and so only the former carries the
+    geometric meaning the f_dist schemes rely on.
+
 
         F_ii = E_x[ sum_c p(c|x) * (d log p(c|x) / d theta_i)^2 ]
 

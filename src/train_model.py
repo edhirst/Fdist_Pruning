@@ -1,3 +1,19 @@
+"""
+Train one architecture on one dataset and write the checkpoint the pruners load.
+
+    python -m src.train_model [config.yaml]      # defaults to src/config.yaml
+
+The architecture comes from `model.common.model_type` and the dataset from
+`dataset.name`; `training.{nn,cnn,transformer}` blocks override the flat
+`training` defaults for that architecture only, which is how the ViT gets its
+own recipe (AdamW, warmup, label smoothing, grad clipping) without disturbing
+the MLP's.
+
+The checkpoint path is `paths.pretrained_model_path` when set, else
+`{model_save_path}/{arch}_{dataset}[_seed{N}].pth`. Set `experiment.seed` (or
+FDIST_SEED) to make the run reproducible and to namespace its checkpoint, so
+that seeds of the same configuration never overwrite each other.
+"""
 import os
 import sys
 import math

@@ -1,3 +1,19 @@
+"""
+How large does the Fisher subset need to be?
+
+    python -m src.subset_experiment [config.yaml]
+
+Every Fisher-based scheme estimates the diagonal from a subset of the training
+data rather than all of it (`pruning.fim_subset_size`, 500 in the paper runs).
+This measures what that costs. It computes a reference diagonal from `full_n`
+samples, then recomputes it at a ladder of smaller N, reporting for each the MSE,
+the maximum absolute error, and the Spearman rank correlation against the
+reference.
+
+The rank correlation is the figure that matters: the pruners only ever use the
+Fisher to ORDER weights, so a subset that reproduces the ranking is sufficient
+even where the entries themselves are still noisy.
+"""
 import os
 import sys
 import json

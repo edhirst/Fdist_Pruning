@@ -1,0 +1,124 @@
+% SimpleNN_h2_n64 — cifar10   (AUC of normalised accuracy over the pruning range; seeds: 5)
+\begin{tabular}{lrrrr}
+\toprule
+Scheme & AUC & floor-corr. & vs.\ magnitude & Compute \\
+\midrule
+Magnitude & 0.633 $\pm$ 0.011 & 0.542 $\pm$ 0.013 & 1.00$\times$ & 6.8 s $\pm$ 0.4 \\
+FIM & 0.634 $\pm$ 0.008 & 0.543 $\pm$ 0.011 & 1.00$\times$ & 10.1 s $\pm$ 0.1 \\
+F-dist (one-shot) & 0.890 $\pm$ 0.005 & 0.863 $\pm$ 0.006 & 1.41$\times$ & 10.0 s $\pm$ 0.1 \\
+F-dist (iterative) & 0.893 $\pm$ 0.004 & 0.866 $\pm$ 0.004 & 1.41$\times$ & 10.0 s $\pm$ 0.1 \\
+F-dist (global) & 0.892 $\pm$ 0.005 & 0.865 $\pm$ 0.005 & 1.41$\times$ & 17.0 s $\pm$ 0.1 \\
+F-dist (exact) & 0.892 $\pm$ 0.004 & 0.866 $\pm$ 0.005 & 1.41$\times$ & 6.2 min $\pm$ 0.3 \\
+\bottomrule
+\end{tabular}
+
+% SimpleViT_d4_e128_h4_p4 — cifar10   (AUC of normalised accuracy over the pruning range; seeds: 5)
+\begin{tabular}{lrrrr}
+\toprule
+Scheme & AUC & floor-corr. & vs.\ magnitude & Compute \\
+\midrule
+Magnitude & 0.678 $\pm$ 0.008 & 0.633 $\pm$ 0.009 & 1.00$\times$ & 6.9 s $\pm$ 0.1 \\
+FIM & 0.484 $\pm$ 0.014 & 0.412 $\pm$ 0.016 & 0.71$\times$ & 37.7 s $\pm$ 0.6 \\
+F-dist (one-shot) & 0.751 $\pm$ 0.015 & 0.716 $\pm$ 0.016 & 1.11$\times$ & 37.5 s $\pm$ 0.6 \\
+F-dist (iterative) & 0.791 $\pm$ 0.013 & 0.762 $\pm$ 0.014 & 1.17$\times$ & 37.4 s $\pm$ 1.7 \\
+F-dist (global) & 0.759 $\pm$ 0.013 & 0.725 $\pm$ 0.015 & 1.12$\times$ & 1.6 min $\pm$ 0.0 \\
+F-dist (exact) & 0.791 $\pm$ 0.014 & 0.761 $\pm$ 0.015 & 1.17$\times$ & 4.59 d $\pm$ 0.0 \\
+\bottomrule
+\end{tabular}
+
+% SimpleNN_h2_n64 — mnist   (AUC of normalised accuracy over the pruning range; seeds: 5)
+\begin{tabular}{lrrrr}
+\toprule
+Scheme & AUC & floor-corr. & vs.\ magnitude & Compute \\
+\midrule
+Magnitude & 0.907 $\pm$ 0.007 & 0.896 $\pm$ 0.008 & 1.00$\times$ & 6.5 s $\pm$ 0.7 \\
+FIM & 0.743 $\pm$ 0.022 & 0.714 $\pm$ 0.024 & 0.82$\times$ & 10.0 s $\pm$ 0.3 \\
+F-dist (one-shot) & 0.891 $\pm$ 0.008 & 0.879 $\pm$ 0.009 & 0.98$\times$ & 9.8 s $\pm$ 0.3 \\
+F-dist (iterative) & 0.924 $\pm$ 0.003 & 0.916 $\pm$ 0.003 & 1.02$\times$ & 9.7 s $\pm$ 0.4 \\
+F-dist (global) & 0.930 $\pm$ 0.002 & 0.922 $\pm$ 0.002 & 1.02$\times$ & 16.9 s $\pm$ 0.4 \\
+F-dist (exact) (K=2) & 0.928 $\pm$ 0.002 & 0.920 $\pm$ 0.002 & 1.02$\times$ & 60.0 s $\pm$ 4.4 \\
+F-dist (exact) (K=3) & 0.928 $\pm$ 0.002 & 0.920 $\pm$ 0.002 & 1.02$\times$ & 80.9 s $\pm$ 3.8 \\
+F-dist (exact) (K=5) & 0.927 $\pm$ 0.003 & 0.919 $\pm$ 0.004 & 1.02$\times$ & 2.0 min $\pm$ 0.0 \\
+F-dist (exact) (K=9) & 0.929 $\pm$ 0.003 & 0.921 $\pm$ 0.004 & 1.02$\times$ & 3.3 min $\pm$ 0.2 \\
+F-dist (exact) (K=17) & 0.927 $\pm$ 0.004 & 0.919 $\pm$ 0.005 & 1.02$\times$ & 5.6 min $\pm$ 0.4 \\
+\bottomrule
+\end{tabular}
+
+% SimpleViT_d4_e128_h4_p4 — mnist   (AUC of normalised accuracy over the pruning range; seeds: 5)
+\begin{tabular}{lrrrr}
+\toprule
+Scheme & AUC & floor-corr. & vs.\ magnitude & Compute \\
+\midrule
+Magnitude & 0.764 $\pm$ 0.005 & 0.738 $\pm$ 0.005 & 1.00$\times$ & 5.9 s $\pm$ 0.1 \\
+FIM & 0.565 $\pm$ 0.030 & 0.517 $\pm$ 0.033 & 0.74$\times$ & 35.6 s $\pm$ 0.5 \\
+F-dist (one-shot) & 0.783 $\pm$ 0.017 & 0.759 $\pm$ 0.019 & 1.03$\times$ & 35.5 s $\pm$ 0.5 \\
+F-dist (iterative) & 0.865 $\pm$ 0.008 & 0.850 $\pm$ 0.008 & 1.13$\times$ & 35.8 s $\pm$ 0.4 \\
+F-dist (global) & 0.837 $\pm$ 0.008 & 0.819 $\pm$ 0.009 & 1.10$\times$ & 1.6 min $\pm$ 0.0 \\
+F-dist (exact) & 0.867 $\pm$ 0.008 & 0.853 $\pm$ 0.009 & 1.14$\times$ & 3.98 d $\pm$ 1.4 \\
+\bottomrule
+\end{tabular}
+
+% SimpleNN_h2_n64 — cifar10   (AUC of normalised MCC over the pruning range; seeds: 5)
+% floor is 0 for normalised MCC, so the floor correction is the identity and its column is omitted
+\begin{tabular}{lrrr}
+\toprule
+Scheme & AUC & vs.\ magnitude & Compute \\
+\midrule
+Magnitude & 0.552 $\pm$ 0.016 & 1.00$\times$ & 6.8 s $\pm$ 0.4 \\
+FIM & 0.559 $\pm$ 0.006 & 1.01$\times$ & 10.1 s $\pm$ 0.1 \\
+F-dist (one-shot) & 0.867 $\pm$ 0.006 & 1.57$\times$ & 10.0 s $\pm$ 0.1 \\
+F-dist (iterative) & 0.869 $\pm$ 0.004 & 1.58$\times$ & 10.0 s $\pm$ 0.1 \\
+F-dist (global) & 0.869 $\pm$ 0.005 & 1.57$\times$ & 17.0 s $\pm$ 0.1 \\
+F-dist (exact) & 0.869 $\pm$ 0.005 & 1.58$\times$ & 6.2 min $\pm$ 0.3 \\
+\bottomrule
+\end{tabular}
+
+% SimpleViT_d4_e128_h4_p4 — cifar10   (AUC of normalised MCC over the pruning range; seeds: 5)
+% floor is 0 for normalised MCC, so the floor correction is the identity and its column is omitted
+\begin{tabular}{lrrr}
+\toprule
+Scheme & AUC & vs.\ magnitude & Compute \\
+\midrule
+Magnitude & 0.636 $\pm$ 0.009 & 1.00$\times$ & 6.9 s $\pm$ 0.1 \\
+FIM & 0.440 $\pm$ 0.017 & 0.69$\times$ & 37.7 s $\pm$ 0.6 \\
+F-dist (one-shot) & 0.729 $\pm$ 0.014 & 1.15$\times$ & 37.5 s $\pm$ 0.6 \\
+F-dist (iterative) & 0.770 $\pm$ 0.014 & 1.21$\times$ & 37.4 s $\pm$ 1.7 \\
+F-dist (global) & 0.736 $\pm$ 0.016 & 1.16$\times$ & 1.6 min $\pm$ 0.0 \\
+F-dist (exact) & 0.770 $\pm$ 0.015 & 1.21$\times$ & 4.59 d $\pm$ 0.0 \\
+\bottomrule
+\end{tabular}
+
+% SimpleNN_h2_n64 — mnist   (AUC of normalised MCC over the pruning range; seeds: 5)
+% floor is 0 for normalised MCC, so the floor correction is the identity and its column is omitted
+\begin{tabular}{lrrr}
+\toprule
+Scheme & AUC & vs.\ magnitude & Compute \\
+\midrule
+Magnitude & 0.898 $\pm$ 0.007 & 1.00$\times$ & 6.5 s $\pm$ 0.7 \\
+FIM & 0.718 $\pm$ 0.023 & 0.80$\times$ & 10.0 s $\pm$ 0.3 \\
+F-dist (one-shot) & 0.881 $\pm$ 0.009 & 0.98$\times$ & 9.8 s $\pm$ 0.3 \\
+F-dist (iterative) & 0.916 $\pm$ 0.003 & 1.02$\times$ & 9.7 s $\pm$ 0.4 \\
+F-dist (global) & 0.922 $\pm$ 0.002 & 1.03$\times$ & 16.9 s $\pm$ 0.4 \\
+F-dist (exact) (K=2) & 0.921 $\pm$ 0.002 & 1.03$\times$ & 60.0 s $\pm$ 4.4 \\
+F-dist (exact) (K=3) & 0.921 $\pm$ 0.002 & 1.03$\times$ & 80.9 s $\pm$ 3.8 \\
+F-dist (exact) (K=5) & 0.919 $\pm$ 0.004 & 1.02$\times$ & 2.0 min $\pm$ 0.0 \\
+F-dist (exact) (K=9) & 0.922 $\pm$ 0.004 & 1.03$\times$ & 3.3 min $\pm$ 0.2 \\
+F-dist (exact) (K=17) & 0.919 $\pm$ 0.005 & 1.02$\times$ & 5.6 min $\pm$ 0.4 \\
+\bottomrule
+\end{tabular}
+
+% SimpleViT_d4_e128_h4_p4 — mnist   (AUC of normalised MCC over the pruning range; seeds: 5)
+% floor is 0 for normalised MCC, so the floor correction is the identity and its column is omitted
+\begin{tabular}{lrrr}
+\toprule
+Scheme & AUC & vs.\ magnitude & Compute \\
+\midrule
+Magnitude & 0.743 $\pm$ 0.006 & 1.00$\times$ & 5.9 s $\pm$ 0.1 \\
+FIM & 0.525 $\pm$ 0.031 & 0.71$\times$ & 35.6 s $\pm$ 0.5 \\
+F-dist (one-shot) & 0.765 $\pm$ 0.021 & 1.03$\times$ & 35.5 s $\pm$ 0.5 \\
+F-dist (iterative) & 0.851 $\pm$ 0.009 & 1.14$\times$ & 35.8 s $\pm$ 0.4 \\
+F-dist (global) & 0.822 $\pm$ 0.008 & 1.11$\times$ & 1.6 min $\pm$ 0.0 \\
+F-dist (exact) & 0.854 $\pm$ 0.010 & 1.15$\times$ & 3.98 d $\pm$ 1.4 \\
+\bottomrule
+\end{tabular}
+

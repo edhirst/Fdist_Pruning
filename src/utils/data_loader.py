@@ -1,3 +1,17 @@
+"""
+Dataset loading, normalisation and the train/val split.
+
+One entry point matters: `build_dataloaders(config)` returns the (train, test)
+loaders for whatever `dataset.name` and `training.*` say, resolving the download
+root from `paths.dataset_path`. The per-dataset helpers below it
+(load_mnist/load_fashion_mnist/load_cifar10) are what it dispatches to.
+
+Dataset names are normalised once, here, by `normalize_dataset_name` ("cifar"
+-> "cifar10" and so on). Everything downstream (checkpoint filenames, result
+JSON metadata, the DATASET_SHAPES lookup in model_builder) keys off that
+canonical spelling, so a config typo fails loudly rather than silently training
+a second copy of a model under a different name.
+"""
 import copy
 import os
 

@@ -9,8 +9,25 @@ from .prunable import get_prunable_mask
 
 class FIMPruner(BasePruner):
     """
-    Prunes weights based on Fisher Information Matrix (FIM).
-    Requires nngeometry library for FIM computation.
+    Fisher pruning: score = I_kk, the Fisher diagonal entry alone.
+
+    The second-order baseline. Note the score carries NO magnitude factor and no
+    square root, which is what distinguishes it from the f_dist family; in the
+    paper's results it is the scheme that most often underperforms plain
+    magnitude, so second-order information by itself is not what wins.
+
+    The Fisher backend is chosen by `fim_calculate_method`: "backprop" (the
+    default everywhere in configs/, and the only option for transformers) or
+    "nngeometry". Neither requires nngeometry unless it is explicitly selected.
+
+    Selection runs only over ACTIVE weights (w != 0) intersected with the
+    eligibility mask from prunable.py.
+
+    Parameters (dict) via set_parameters():
+        pruning_threshold: float in [0,1], the fraction of ALL prunable
+            parameters to remove
+        fim_calculate_method: "backprop" or "nngeometry"
+        prunable_exclude: list of groups to protect, see prunable.py
     """
     def __init__(self, parameters=None):
         super().__init__()

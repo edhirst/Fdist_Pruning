@@ -1,3 +1,17 @@
+"""
+Test-set metrics, AUC, and the comparison plots.
+
+`evaluate_metrics` derives accuracy, precision, F1 and MCC from ONE forward pass
+over the loader (collect_predictions, then the private _accuracy/_precision/
+_f1/_mcc helpers), which is why listing more metrics in `evaluation.metrics`
+changes what is recorded but not the runtime. The single-metric wrappers below
+it each do their own pass and exist for interactive use;
+tests/test_single_pass_metrics.py asserts the two agree.
+
+`calculate_auc` integrates a metric curve over the pruning range with the
+trapezoid rule. The curves passed to it are NORMALISED by the dense-model value,
+so a scheme that held performance perfectly would score 1.0.
+"""
 import numpy as np
 import torch
 import matplotlib.pyplot as plt
