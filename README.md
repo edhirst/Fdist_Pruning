@@ -155,10 +155,15 @@ python -m tests.test_single_pass_metrics           # one-pass metrics == per-met
 ## Citation
 
 ```bibtex
-@article{Berman:2026fdist,
-    author  = {Berman, David S. and Fu, Yen-Yu and Hirst, Edward and Obirai, Thelma Chiwete},
-    title   = {{Fisher Information Distance Pruning for Neural Architectures}},
-    year    = {2026}
+@article{Berman:2026rvt,
+    author = "Berman, David S. and Fu, Yen-Yu and Hirst, Edward and Obirai, Thelma Chiwete",
+    title = "{Optimal Pruning for Neural Architectures using Fisher Information Distances}",
+    eprint = "2609.16129",
+    archivePrefix = "arXiv",
+    primaryClass = "cs.AI",
+    reportNumber = "QMUL-PH-26-32, QMUL-PH-26-32",
+    month = "9",
+    year = "2026"
 }
 ```
 
